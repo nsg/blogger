@@ -1,0 +1,7 @@
+/target
+.env
+.claude-sandbox/
+.playwright-output/
+.mcp.json
+frontend/dist/main.js
+node_modules/
