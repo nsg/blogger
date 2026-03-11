@@ -3,11 +3,17 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, Uri, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use rust_embed::Embed;
 use serde_json::{Value, json};
-use tower_http::{cors::CorsLayer, services::ServeDir};
+use tower_http::cors::CorsLayer;
+
+#[derive(Embed)]
+#[folder = "frontend/dist/"]
+struct Assets;
 
 struct AppState {
     ollama_key: String,
@@ -251,6 +257,22 @@ async fn web_fetch(
     Ok(Json(result))
 }
 
+async fn static_handler(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match Assets::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], file.data).into_response()
+        }
+        None => match Assets::get("index.html") {
+            Some(file) => ([(header::CONTENT_TYPE, "text/html")], file.data).into_response(),
+            None => (StatusCode::NOT_FOUND, "404").into_response(),
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -274,7 +296,7 @@ async fn main() {
     let app = Router::new()
         .nest("/api", api)
         .with_state(state)
-        .fallback_service(ServeDir::new("frontend/dist"))
+        .fallback(static_handler)
         .layer(CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
