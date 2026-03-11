@@ -18,6 +18,8 @@ struct Assets;
 struct AppState {
     ollama_key: String,
     http: reqwest::Client,
+    preview_url: tokio::sync::watch::Receiver<Option<String>>,
+    initial_file: Option<(std::path::PathBuf, String)>,
 }
 
 const MAX_TOOL_ROUNDS: usize = 6;
@@ -294,6 +296,155 @@ async fn web_fetch(
     Ok(Json(result))
 }
 
+async fn preview(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let base_url = state.preview_url.borrow().clone();
+
+    // Derive the page slug from the file path relative to content/
+    // e.g. "post/2026/blogger-helper.md" -> "/post/2026/blogger-helper/"
+    let slug = state.initial_file.as_ref().and_then(|(path, _)| {
+        let path_str = path.to_string_lossy();
+        let content_marker = "/content/";
+        let idx = path_str.find(content_marker)?;
+        let relative = &path_str[idx + content_marker.len()..];
+        let stem = relative.strip_suffix(".md").unwrap_or(relative);
+        Some(format!("/{stem}/"))
+    });
+
+    let url = match (&base_url, &slug) {
+        (Some(base), Some(s)) => Some(format!("{}{}", base.trim_end_matches('/'), s)),
+        (Some(base), None) => Some(base.clone()),
+        _ => None,
+    };
+
+    Json(json!({ "url": url }))
+}
+
+async fn initial_content(State(state): State<Arc<AppState>>) -> Json<Value> {
+    match &state.initial_file {
+        Some((path, _)) => {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            Json(json!({
+                "path": path.display().to_string(),
+                "content": content,
+            }))
+        }
+        None => Json(json!({ "path": null, "content": null })),
+    }
+}
+
+async fn save_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiErr> {
+    let path = match &state.initial_file {
+        Some((path, _)) => path,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "no file loaded" })),
+            ));
+        }
+    };
+
+    let content = body
+        .get("content")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'content' field" })),
+            )
+        })?;
+
+    // Write to a temp file then rename to avoid Zola seeing a truncated file
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(".blogger-save-{}.tmp", std::process::id()));
+    std::fs::write(&tmp, content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to write temp file: {e}") })),
+        )
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to rename file: {e}") })),
+        )
+    })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn launch_zola_container(site_path: &std::path::Path) -> Result<(), String> {
+    let site_dir = site_path.join("site");
+    let serve_path = if site_dir.is_dir() {
+        &site_dir
+    } else {
+        site_path
+    };
+
+    let canonical = serve_path
+        .canonicalize()
+        .map_err(|e| format!("invalid path: {e}"))?;
+
+    // Stop any leftover container from a previous run
+    let _ = std::process::Command::new("podman")
+        .args(["rm", "-f", "blogger-zola"])
+        .output();
+
+    let status = std::process::Command::new("podman")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            "blogger-zola",
+            "-p",
+            "1111:1111",
+            "-p",
+            "1024:1024",
+            "-v",
+            &format!("{}:/site:z", canonical.display()),
+            "-w",
+            "/site",
+            "ghcr.io/getzola/zola:v0.19.2",
+            "serve",
+            "-p",
+            "1111",
+            "-i",
+            "0.0.0.0",
+            "--base-url",
+            "localhost",
+        ])
+        .status()
+        .map_err(|e| format!("failed to run podman: {e}"))?;
+
+    if !status.success() {
+        return Err("podman container failed to start".into());
+    }
+
+    Ok(())
+}
+
+async fn wait_for_zola(tx: tokio::sync::watch::Sender<Option<String>>) {
+    let client = reqwest::Client::new();
+    for i in 0..60 {
+        if client.get("http://localhost:1111").send().await.is_ok() {
+            println!("zola ready after ~{}ms", i * 500);
+            let _ = tx.send(Some("http://localhost:1111".into()));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    eprintln!("warning: zola container never became ready");
+}
+
+fn stop_zola() {
+    let _ = std::process::Command::new("podman")
+        .args(["rm", "-f", "blogger-zola"])
+        .output();
+}
+
 async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -319,16 +470,82 @@ async fn main() {
         eprintln!("warning: OLLAMA_API_KEY not set — /api/chat will fail");
     }
 
+    let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
+
+    let args: Vec<String> = std::env::args().collect();
+    let mut initial_file: Option<(std::path::PathBuf, String)> = None;
+
+    if let Some(path) = args.get(1) {
+        let input_path = std::path::Path::new(path);
+        if !input_path.exists() {
+            eprintln!("error: path does not exist: {path}");
+            std::process::exit(1);
+        }
+
+        let (site_path, file_path) = if input_path.is_file() {
+            // Walk up from the file to find the blog root (directory containing "site/")
+            let file_abs = input_path
+                .canonicalize()
+                .expect("failed to canonicalize file path");
+            let mut blog_root = None;
+            for ancestor in file_abs.ancestors().skip(1) {
+                if ancestor.join("site").is_dir() {
+                    blog_root = Some(ancestor.to_path_buf());
+                    break;
+                }
+                // Also check if this directory itself is a Zola site root
+                if ancestor.join("config.toml").exists() || ancestor.join("config.yaml").exists() {
+                    blog_root = Some(ancestor.parent().unwrap_or(ancestor).to_path_buf());
+                    break;
+                }
+            }
+            let root = blog_root.unwrap_or_else(|| {
+                eprintln!("error: could not find blog root from file path: {path}");
+                std::process::exit(1);
+            });
+            (root, Some(file_abs))
+        } else {
+            (input_path.to_path_buf(), None)
+        };
+
+        if let Some(fp) = file_path {
+            match std::fs::read_to_string(&fp) {
+                Ok(content) => {
+                    println!("opening file: {}", fp.display());
+                    initial_file = Some((fp, content));
+                }
+                Err(e) => {
+                    eprintln!("warning: could not read file {}: {e}", fp.display());
+                }
+            }
+        }
+
+        match launch_zola_container(&site_path) {
+            Ok(()) => {
+                println!("zola container started, waiting for it to be ready...");
+                tokio::spawn(wait_for_zola(preview_tx));
+            }
+            Err(e) => {
+                eprintln!("warning: failed to start zola: {e}");
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         ollama_key,
         http: reqwest::Client::new(),
+        preview_url: preview_rx,
+        initial_file,
     });
 
     let api = Router::new()
         .route("/health", get(health))
         .route("/chat", post(chat))
         .route("/web_search", post(web_search))
-        .route("/web_fetch", post(web_fetch));
+        .route("/web_fetch", post(web_fetch))
+        .route("/preview", get(preview))
+        .route("/initial-content", get(initial_content))
+        .route("/save", post(save_file));
 
     let app = Router::new()
         .nest("/api", api)
@@ -341,5 +558,15 @@ async fn main() {
         .expect("failed to bind to port 3000");
 
     println!("listening on http://localhost:3000");
-    axum::serve(listener, app).await.expect("server error");
+
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        println!("\nshutting down...");
+        stop_zola();
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .expect("server error");
 }

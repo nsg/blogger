@@ -29,6 +29,9 @@ let lastSuggestedVersion: string | null = null;
 let postSuggestion: ((content: string, edits?: { old_text: string; new_text: string }[]) => void) | null = null;
 let showFeedbackIndicator: (() => void) | null = null;
 let hideFeedbackIndicator: (() => void) | null = null;
+let processingParagraphId: string | null = null;
+let onProcessingChanged: (() => void) | null = null;
+const nopParagraphs = new Set<string>();
 
 // --- Utility functions ---
 function hashString(s: string): string {
@@ -113,6 +116,7 @@ function reconcileParagraphs(model: { getLineCount: () => number; getLineContent
           existing.currentText = pp.text;
           existing.history.push({ text: pp.text, timestamp: Date.now() });
           if (existing.history.length > 5) existing.history.shift();
+          nopParagraphs.delete(existing.id);
         }
         ei = k + 1;
         matched = true;
@@ -136,7 +140,7 @@ function reconcileParagraphs(model: { getLineCount: () => number; getLineContent
 
   // Remove deleted paragraphs
   for (const [id] of paragraphMap) {
-    if (!usedIds.has(id)) paragraphMap.delete(id);
+    if (!usedIds.has(id)) { paragraphMap.delete(id); nopParagraphs.delete(id); }
   }
 }
 
@@ -148,6 +152,8 @@ async function requestSuggestion(paragraphId: string) {
   if (paragraphId === lastSuggestedParaId && para.currentText === lastSuggestedVersion) return;
 
   suggestionInFlight = true;
+  processingParagraphId = paragraphId;
+  if (onProcessingChanged) onProcessingChanged();
   lastSuggestionTime = Date.now();
   if (showFeedbackIndicator) showFeedbackIndicator();
 
@@ -173,7 +179,7 @@ async function requestSuggestion(paragraphId: string) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages }),
     });
-    if (!res.ok) { suggestionInFlight = false; if (hideFeedbackIndicator) hideFeedbackIndicator(); return; }
+    if (!res.ok) { suggestionInFlight = false; processingParagraphId = null; if (onProcessingChanged) onProcessingChanged(); if (hideFeedbackIndicator) hideFeedbackIndicator(); return; }
     const data = await res.json();
     const reply =
       data?.message?.content || data?.choices?.[0]?.message?.content || "";
@@ -188,6 +194,7 @@ async function requestSuggestion(paragraphId: string) {
     if (reply && reply.trim() !== "NOP" && postSuggestion) {
       lastSuggestedParaId = paragraphId;
       lastSuggestedVersion = para.currentText;
+      nopParagraphs.delete(paragraphId);
       const previewWords = para.currentText.split(/\s+/).slice(0, 6).join(" ");
       const ref = `<span class="suggestion-ref">Re: "${previewWords}..."</span>`;
       postSuggestion(ref + reply, edits.length > 0 ? edits : undefined);
@@ -195,15 +202,22 @@ async function requestSuggestion(paragraphId: string) {
       // AI returned only a tool call with no text content
       lastSuggestedParaId = paragraphId;
       lastSuggestedVersion = para.currentText;
+      nopParagraphs.delete(paragraphId);
       const previewWords = para.currentText.split(/\s+/).slice(0, 6).join(" ");
       const ref = `<span class="suggestion-ref">Re: "${previewWords}..."</span>`;
       postSuggestion(ref + "Suggested edit:", edits);
+    } else if (reply && reply.trim() === "NOP") {
+      lastSuggestedParaId = paragraphId;
+      lastSuggestedVersion = para.currentText;
+      nopParagraphs.add(paragraphId);
     }
   } catch {
     // silently ignore suggestion errors
   }
   if (hideFeedbackIndicator) hideFeedbackIndicator();
   suggestionInFlight = false;
+  processingParagraphId = null;
+  if (onProcessingChanged) onProcessingChanged();
 }
 
 function initMonaco() {
@@ -213,7 +227,11 @@ function initMonaco() {
     },
   });
 
-  require(["vs/editor/editor.main"], () => {
+  require(["vs/editor/editor.main"], async () => {
+    interface IModelDeltaDecoration {
+      range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
+      options: Record<string, unknown>;
+    }
     const monaco = ((window as unknown) as Record<string, unknown>).monaco as {
       editor: {
         create: (
@@ -229,11 +247,18 @@ function initMonaco() {
           };
           getPosition: () => { lineNumber: number; column: number } | null;
           onDidChangeCursorPosition: (cb: (e: { position: { lineNumber: number; column: number } }) => void) => void;
+          onMouseDown: (cb: (e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => void) => void;
+          deltaDecorations: (oldDecorations: string[], newDecorations: IModelDeltaDecoration[]) => string[];
           executeEdits: (source: string, edits: { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number }; text: string }[]) => void;
           layout: () => void;
         };
         defineTheme: (name: string, data: Record<string, unknown>) => void;
+        MouseTargetType: Record<string, number>;
       };
+      languages: {
+        setMonarchTokensProvider: (languageId: string, provider: Record<string, unknown>) => void;
+      };
+      Range: new (startLine: number, startCol: number, endLine: number, endCol: number) => { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
     };
 
     monaco.editor.defineTheme("nexus", {
@@ -251,12 +276,15 @@ function initMonaco() {
         { token: "type", foreground: "38bdf8" },
         { token: "variable", foreground: "e5e7eb" },
         { token: "operator", foreground: "f472b6" },
-        { token: "string.link", foreground: "38bdf8" },
+        { token: "string.link", foreground: "7b8a9e" },
         { token: "string.escape", foreground: "fbbf24" },
         { token: "keyword.markdown", foreground: "c084fc", fontStyle: "bold" },
         { token: "string.bold", foreground: "fb923c", fontStyle: "bold" },
         { token: "string.italic", foreground: "a78bfa", fontStyle: "italic" },
         { token: "variable.source", foreground: "67e8f9" },
+        { token: "frontmatter.delimiter", foreground: "6b7280" },
+        { token: "frontmatter.key", foreground: "fb923c" },
+        { token: "frontmatter.section", foreground: "38bdf8" },
       ],
       colors: {
         "editor.background": "#1a1a1a",
@@ -267,13 +295,149 @@ function initMonaco() {
         "editor.selectionBackground": "#ffffff20",
         "editorCursor.foreground": "#d4d4d4",
         "editorIndentGuide.background": "#333333",
+        "editorBracketHighlight.foreground1": "#d4d4d4",
+        "editorBracketHighlight.foreground2": "#d4d4d4",
+        "editorBracketHighlight.foreground3": "#d4d4d4",
+        "editorBracketHighlight.foreground4": "#d4d4d4",
+        "editorBracketHighlight.foreground5": "#d4d4d4",
+        "editorBracketHighlight.foreground6": "#d4d4d4",
       },
     });
+
+    // Extend markdown tokenizer with Zola +++ front matter (TOML) support
+    monaco.languages.setMonarchTokensProvider("markdown", {
+      defaultToken: "",
+      tokenPostfix: ".md",
+
+      tokenizer: {
+        root: [
+          // Zola front matter opening +++
+          [/^\+\+\+\s*$/, { token: "frontmatter.delimiter", next: "@frontmatter" }],
+
+          // Fenced code blocks
+          [/^\s*```\s*([\w+#-]*)\s*$/, { token: "string", next: "@codeblock" }],
+
+          // Headings
+          [/^#{1,6}\s.*$/, "keyword.markdown"],
+
+          // Horizontal rules
+          [/^\s*(---+|===+|\*\*\*+)\s*$/, "keyword.markdown"],
+
+          // Blockquotes
+          [/^\s*>+/, "comment"],
+
+          // List markers
+          [/^\s*([\*\-+])\s/, "keyword.markdown"],
+          [/^\s*\d+\.\s/, "keyword.markdown"],
+
+          // Inline links: [text](url) — allow nested brackets for linked images
+          [/!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(/, { token: "string.link", next: "@linkUrl" }],
+
+          // Inline code
+          [/`[^`]+`/, "string"],
+
+          // Bold
+          [/\*\*([^*]|\*(?!\*))+\*\*/, "string.bold"],
+          [/__([^_]|_(?!_))+__/, "string.bold"],
+
+          // Italic
+          [/\*[^*]+\*/, "string.italic"],
+          [/_[^_]+_/, "string.italic"],
+
+          // Bare URLs
+          [/https?:\/\/[^\s>\]]+/, "string.link"],
+
+          // HTML tags
+          [/<\/?\w+[^>]*>/, "tag"],
+        ],
+
+        // Zola TOML front matter
+        frontmatter: [
+          [/^\+\+\+\s*$/, { token: "frontmatter.delimiter", next: "@pop" }],
+          [/^\s*\[[^\]]*\]/, "frontmatter.section"],       // [taxonomies]
+          [/^[\w.-]+/, "frontmatter.key"],                  // key names
+          [/=/, "operator"],
+          [/"[^"]*"/, "string"],                            // "string values"
+          [/'[^']*'/, "string"],
+          [/\d{4}-\d{2}-\d{2}[T\d:+.-]*/, "number"],      // dates
+          [/\b(true|false)\b/, "keyword"],
+          [/\d+/, "number"],
+          [/\[/, "delimiter"],
+          [/\]/, "delimiter"],
+          [/,/, "delimiter"],
+        ],
+
+        // Link URL inside (...) — only entered after [text](
+        linkUrl: [
+          [/[^)]+/, "string.link"],
+          [/\)/, { token: "string.link", next: "@pop" }],
+        ],
+
+        // Fenced code block body
+        codeblock: [
+          [/^\s*```\s*$/, { token: "string", next: "@pop" }],
+          [/.*$/, "variable.source"],
+        ],
+      },
+    });
+
+    let initialContent = getDefaultContent();
+    let hasFile = false;
+    try {
+      const res = await fetch("/api/initial-content");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.content) {
+          initialContent = data.content;
+          hasFile = true;
+        }
+      }
+    } catch {
+      // use default content
+    }
+
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    let saving = false;
+    let zolaUrl: string | null = null;
+    let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+    const previewIframe = document.getElementById("ref-iframe") as HTMLIFrameElement | null;
+
+    async function autoSave(content: string) {
+      if (saving) return;
+      saving = true;
+      try {
+        await fetch("/api/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content }),
+        });
+        // Show placeholder while Zola rebuilds, then poll until it's back
+        if (previewIframe && previewIframe.src.includes("localhost:1111")) {
+          zolaUrl = previewIframe.src;
+          previewIframe.src = "placeholder.html";
+          if (recoveryTimer) clearTimeout(recoveryTimer);
+          const poll = async (retries: number) => {
+            if (retries <= 0 || !zolaUrl) { previewIframe.src = zolaUrl || ""; return; }
+            try {
+              const r = await fetch(zolaUrl, { mode: "no-cors" });
+              previewIframe.src = zolaUrl;
+              zolaUrl = null;
+            } catch {
+              recoveryTimer = setTimeout(() => poll(retries - 1), 400);
+            }
+          };
+          recoveryTimer = setTimeout(() => poll(30), 800);
+        }
+      } catch {
+        // silently ignore save errors
+      }
+      saving = false;
+    }
 
     const editor = monaco.editor.create(
       document.getElementById("editor-container")!,
       {
-        value: getDefaultContent(),
+        value: initialContent,
         language: "markdown",
         theme: "nexus",
         fontFamily: "'Plus Jakarta Sans', sans-serif",
@@ -281,8 +445,14 @@ function initMonaco() {
         lineHeight: 28,
         wordWrap: "on",
         minimap: { enabled: false },
+        glyphMargin: true,
+        glyphMarginWidth: 16,
+        folding: true,
+        showFoldingControls: "always",
         lineNumbers: "on",
-        renderLineHighlight: "line",
+        lineNumbersMinChars: 2,
+        lineDecorationsWidth: 0,
+        renderLineHighlight: "all",
         scrollBeyondLastLine: false,
         padding: { top: 20, bottom: 20 },
         overviewRulerLanes: 0,
@@ -312,11 +482,17 @@ function initMonaco() {
     model.onDidChangeContent(() => {
       updateWordCount();
 
+      if (hasFile) {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => autoSave(model.getValue()), 20_000);
+      }
+
       // Debounce paragraph reconciliation to avoid running expensive
       // line-by-line parsing + change-ratio computations on every keystroke
       if (reconcileTimer) clearTimeout(reconcileTimer);
       reconcileTimer = setTimeout(() => {
         reconcileParagraphs(model);
+        updateGutterIcons();
 
         // Check new-paragraph trigger: cursor on blank line, paragraph above is non-empty
         const pos = editor.getPosition();
@@ -349,6 +525,42 @@ function initMonaco() {
       const initPara = currentParagraphId ? paragraphMap.get(currentParagraphId) : null;
       anchorText = initPara ? initPara.currentText : null;
     }
+
+    // Gutter paragraph action icons
+    let gutterDecorations: string[] = [];
+    function updateGutterIcons() {
+      const decorations: IModelDeltaDecoration[] = [];
+      for (const [id, para] of paragraphMap) {
+        const isProcessing = id === processingParagraphId;
+        const isNop = nopParagraphs.has(id);
+        let className = "paragraph-action-icon";
+        if (isProcessing) className += " paragraph-action-processing";
+        else if (isNop) className += " paragraph-action-nop";
+        let hoverMsg = "Get AI feedback on this paragraph";
+        if (isProcessing) hoverMsg = "Analyzing paragraph…";
+        else if (isNop) hoverMsg = "AI: paragraph looks good";
+        decorations.push({
+          range: new monaco.Range(para.startLine, 1, para.startLine, 1),
+          options: {
+            glyphMarginClassName: className,
+            glyphMarginHoverMessage: { value: hoverMsg },
+          },
+        });
+      }
+      gutterDecorations = editor.deltaDecorations(gutterDecorations, decorations);
+    }
+    updateGutterIcons();
+    onProcessingChanged = () => updateGutterIcons();
+
+    editor.onMouseDown((e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => {
+      // MouseTargetType.GUTTER_GLYPH_MARGIN = 2
+      if (e.target.type === 2 && e.target.position) {
+        const paraId = getParagraphAtLine(e.target.position.lineNumber);
+        if (paraId) {
+          requestSuggestion(paraId);
+        }
+      }
+    });
 
     // Cursor-move trigger
     editor.onDidChangeCursorPosition((e: { position: { lineNumber: number; column: number } }) => {
@@ -763,9 +975,32 @@ function initAssistant() {
   get canSuggest() { return !suggestionInFlight && Date.now() - lastSuggestionTime >= 30_000; },
 };
 
+async function initPreview() {
+  const iframe = document.getElementById("ref-iframe") as HTMLIFrameElement;
+  const input = document.getElementById("url-input") as HTMLInputElement;
+
+  for (let attempt = 0; attempt < 120; attempt++) {
+    try {
+      const res = await fetch("/api/preview");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.url) {
+          iframe.src = data.url;
+          input.value = data.url;
+          return;
+        }
+      }
+    } catch {
+      // server not ready yet
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 initMonaco();
 initPaneToggles();
 initDividerDrag("divider-left", "pane-left", "pane-center");
 initDividerDrag("divider-right", "pane-center", "pane-right");
 initUrlBar();
 initAssistant();
+initPreview();
