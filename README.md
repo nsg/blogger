@@ -26,8 +26,8 @@ Blogger is a local writing tool that combines a Monaco editor, an AI assistant, 
 git clone <repo-url> && cd blogger
 ./install.sh
 
-# Set your Ollama API key
-export OLLAMA_API_KEY="your-key-here"
+# Store your Ollama API key in the system keyring
+blogger set-key
 
 # Open an existing post
 blogger ~/blog/site/content/posts/my-post.md
@@ -46,16 +46,24 @@ Open `http://localhost:3000` in your browser.
 
 ## Configuration
 
-| Variable | Description | Default |
-|---|---|---|
-| `OLLAMA_API_KEY` | API key for Ollama chat, search, and fetch | *(required)* |
+### API Key
 
-Place it in a `.env` file in the working directory or export it in your shell.
+Store your Ollama API key securely in the system keyring:
+
+```bash
+blogger set-key
+```
+
+The key is looked up in this order:
+
+1. `OLLAMA_API_KEY` environment variable (or `.env` file)
+2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
 
 ## Usage
 
 ```
 blogger [PATH]
+blogger set-key
 ```
 
 **PATH** can be:
