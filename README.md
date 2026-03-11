@@ -22,6 +22,9 @@ Blogger is a local writing tool that combines a Monaco editor, an AI assistant, 
 ## Quick Start
 
 ```bash
+# Install build dependency (Debian/Ubuntu)
+sudo apt install libdbus-1-dev
+
 # Clone and install
 git clone <repo-url> && cd blogger
 ./install.sh
@@ -42,6 +45,7 @@ Open `http://localhost:3000` in your browser.
 
 - **Rust** toolchain (for building)
 - **Podman** — runs Zola in a container for live preview
+- **D-Bus secret service** (GNOME Keyring, KDE Wallet, etc.) — stores the API key
 - **Ollama API key** — powers the AI assistant
 
 ## Configuration
