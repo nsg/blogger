@@ -2,6 +2,7 @@
 .env
 .claude-sandbox/
 .playwright-output/
+.playwright-mcp/
 .mcp.json
 frontend/dist/main.js
 node_modules/
