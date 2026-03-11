@@ -61,6 +61,27 @@ fn web_tools() -> Value {
                     }
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_paragraph",
+                "description": "Propose a concrete edit to the current paragraph. Use this whenever you have a specific improvement — the writer will see an 'Apply fix' button. Provide the exact old text to find and the new replacement text.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["old_text", "new_text"],
+                    "properties": {
+                        "old_text": {
+                            "type": "string",
+                            "description": "The exact text to replace (must match current paragraph text exactly or be a substring of it)"
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "The replacement text"
+                        }
+                    }
+                }
+            }
         }
     ])
 }
@@ -176,6 +197,22 @@ async fn chat(
 
         if let Some(calls) = tool_calls {
             if calls.is_empty() {
+                return Ok(Json(response));
+            }
+
+            // Check if any call is edit_paragraph — return those to the frontend
+            let edit_calls: Vec<&Value> = calls
+                .iter()
+                .filter(|c| {
+                    c.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("edit_paragraph")
+                })
+                .collect();
+
+            if !edit_calls.is_empty() {
+                // Return the response as-is so the frontend can render Apply buttons
                 return Ok(Json(response));
             }
 

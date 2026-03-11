@@ -26,7 +26,7 @@ let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
 let suggestionInFlight = false;
 let lastSuggestedParaId: string | null = null;
 let lastSuggestedVersion: string | null = null;
-let postSuggestion: ((content: string) => void) | null = null;
+let postSuggestion: ((content: string, edits?: { old_text: string; new_text: string }[]) => void) | null = null;
 let showFeedbackIndicator: (() => void) | null = null;
 let hideFeedbackIndicator: (() => void) | null = null;
 
@@ -159,7 +159,7 @@ async function requestSuggestion(paragraphId: string) {
     {
       role: "system" as const,
       content:
-        "You are a writing assistant providing brief paragraph-level feedback. You receive the editing history of a paragraph (oldest to newest). The LAST version is the writer's current text — do NOT suggest changes the writer has already made. Consider the editing direction and give 1-2 sentences of specific, actionable feedback about the current version only. If the paragraph contains factual claims (dates, statistics, names, events, scientific statements), use your web_search and web_fetch tools to verify them. Flag any inaccuracies with a brief correction and source. Also watch for bias: if the writing uses loaded language, presents only one side of a debate, omits key counterarguments, or makes sweeping generalizations, briefly point it out and suggest how to make the argument more balanced. IMPORTANT: If the paragraph is already well-written and you have no actionable feedback, respond with exactly \"NOP\" and nothing else. Only speak when you have something worth changing.",
+        "You are a writing assistant providing brief paragraph-level feedback. You receive the editing history of a paragraph (oldest to newest). The LAST version is the writer's current text — do NOT suggest changes the writer has already made. Consider the editing direction and give 1-2 sentences of specific, actionable feedback about the current version only. If the paragraph contains factual claims (dates, statistics, names, events, scientific statements), use your web_search and web_fetch tools to verify them. Flag any inaccuracies with a brief correction and source. Also watch for bias: if the writing uses loaded language, presents only one side of a debate, omits key counterarguments, or makes sweeping generalizations, briefly point it out and suggest how to make the argument more balanced. When you have a concrete improvement, use the edit_paragraph tool to propose the exact text change — the writer will see an 'Apply fix' button. The old_text is matched as an exact case-sensitive substring search in the editor, so it must appear verbatim in the current paragraph text. The new_text replaces the first match. Provide your brief explanation in the text response and the precise edit via the tool. IMPORTANT: If the paragraph is already well-written and you have no actionable feedback, respond with exactly \"NOP\" and nothing else. Only speak when you have something worth changing. Never use em dashes in your writing or suggestions.",
     },
     {
       role: "user" as const,
@@ -177,12 +177,27 @@ async function requestSuggestion(paragraphId: string) {
     const data = await res.json();
     const reply =
       data?.message?.content || data?.choices?.[0]?.message?.content || "";
+    // Extract edit_paragraph tool calls if present
+    const toolCalls = data?.message?.tool_calls as
+      | { function: { name: string; arguments: { old_text: string; new_text: string } } }[]
+      | undefined;
+    const edits = (toolCalls || [])
+      .filter((tc) => tc.function?.name === "edit_paragraph")
+      .map((tc) => tc.function.arguments);
+
     if (reply && reply.trim() !== "NOP" && postSuggestion) {
       lastSuggestedParaId = paragraphId;
       lastSuggestedVersion = para.currentText;
       const previewWords = para.currentText.split(/\s+/).slice(0, 6).join(" ");
       const ref = `<span class="suggestion-ref">Re: "${previewWords}..."</span>`;
-      postSuggestion(ref + reply);
+      postSuggestion(ref + reply, edits.length > 0 ? edits : undefined);
+    } else if (edits.length > 0 && postSuggestion) {
+      // AI returned only a tool call with no text content
+      lastSuggestedParaId = paragraphId;
+      lastSuggestedVersion = para.currentText;
+      const previewWords = para.currentText.split(/\s+/).slice(0, 6).join(" ");
+      const ref = `<span class="suggestion-ref">Re: "${previewWords}..."</span>`;
+      postSuggestion(ref + "Suggested edit:", edits);
     }
   } catch {
     // silently ignore suggestion errors
@@ -210,9 +225,11 @@ function initMonaco() {
             getValue: () => string;
             getLineCount: () => number;
             getLineContent: (lineNumber: number) => string;
+            findMatches: (searchString: string, searchOnlyEditableRange: boolean, isRegex: boolean, matchCase: boolean, wordSeparators: string | null, captureMatches: boolean) => { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number } }[];
           };
           getPosition: () => { lineNumber: number; column: number } | null;
           onDidChangeCursorPosition: (cb: (e: { position: { lineNumber: number; column: number } }) => void) => void;
+          executeEdits: (source: string, edits: { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number }; text: string }[]) => void;
           layout: () => void;
         };
         defineTheme: (name: string, data: Record<string, unknown>) => void;
@@ -369,10 +386,61 @@ function initMonaco() {
     resizeObserver.observe(document.getElementById("editor-container")!);
 
     getEditorValue = () => model.getValue();
+    applyEditorEdit = (oldText: string, newText: string): boolean => {
+      const matches = model.findMatches(oldText, false, false, true, null, true);
+      if (matches.length === 0) return false;
+      editor.executeEdits("ai-fix", [{ range: matches[0].range, text: newText }]);
+      return true;
+    };
   });
 }
 
 let getEditorValue: () => string = () => "";
+let applyEditorEdit: ((oldText: string, newText: string) => boolean) | null = null;
+
+function appendEditButtons(
+  bubble: HTMLElement,
+  edits: { old_text: string; new_text: string }[]
+) {
+  for (const edit of edits) {
+    const container = document.createElement("div");
+    container.className = "apply-fix-container";
+
+    // Preview of old → new
+    const preview = document.createElement("div");
+    preview.className = "apply-fix-preview";
+    preview.innerHTML =
+      `<span class="fix-old">${escapeHtml(edit.old_text)}</span>` +
+      `<span class="fix-arrow">\u2192</span>` +
+      `<span class="fix-new">${escapeHtml(edit.new_text)}</span>`;
+
+    const btn = document.createElement("button");
+    btn.className = "apply-fix-btn";
+    btn.textContent = "Apply fix";
+    btn.addEventListener("click", () => {
+      if (applyEditorEdit && applyEditorEdit(edit.old_text, edit.new_text)) {
+        btn.textContent = "Applied";
+        btn.disabled = true;
+        btn.classList.add("applied");
+      } else {
+        btn.textContent = "Text not found";
+        btn.classList.add("failed");
+        setTimeout(() => {
+          btn.textContent = "Apply fix";
+          btn.classList.remove("failed");
+        }, 2000);
+      }
+    });
+
+    container.appendChild(preview);
+    container.appendChild(btn);
+    bubble.appendChild(container);
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
 function getDefaultContent(): string {
   return `# Welcome to Blogger
@@ -505,7 +573,7 @@ function initAssistant() {
     {
       role: "system",
       content:
-        "You are a helpful writing assistant embedded in a writing tool. Help the user improve, edit, brainstorm, and refine their writing. Be concise and direct. When the user's editor content is provided, reference it as needed. You have access to web_search and web_fetch tools — use them to research topics, verify facts, or find sources when it would improve your response.",
+        "You are a helpful writing assistant embedded in a writing tool. Help the user improve, edit, brainstorm, and refine their writing. Be concise and direct. When the user's editor content is provided, reference it as needed. You have access to web_search and web_fetch tools — use them to research topics, verify facts, or find sources when it would improve your response. You also have an edit_paragraph tool — use it to propose concrete edits to the user's text. The old_text is matched as an exact case-sensitive substring search in the editor, so it must appear verbatim in the current text. The new_text replaces the first match. The user will see an 'Apply fix' button. Never use em dashes in your writing or suggestions.",
     },
   ];
 
@@ -609,10 +677,22 @@ function initAssistant() {
 
       const data = await res.json();
       const reply =
-        data?.message?.content || data?.choices?.[0]?.message?.content || "No response";
+        data?.message?.content || data?.choices?.[0]?.message?.content || "";
 
-      history.push({ role: "assistant", content: reply });
-      addMessageEl("ai", reply);
+      // Extract edit_paragraph tool calls
+      const toolCalls = data?.message?.tool_calls as
+        | { function: { name: string; arguments: { old_text: string; new_text: string } } }[]
+        | undefined;
+      const edits = (toolCalls || [])
+        .filter((tc) => tc.function?.name === "edit_paragraph")
+        .map((tc) => tc.function.arguments);
+
+      history.push({ role: "assistant", content: reply || "Suggested edit:" });
+      const bubble = addMessageEl("ai", reply || "Suggested edit:");
+
+      if (edits.length > 0 && bubble) {
+        appendEditButtons(bubble, edits);
+      }
     } catch (e) {
       removeTypingIndicator();
       addMessageEl("ai", `Network error: ${e}`, "error");
@@ -636,8 +716,11 @@ function initAssistant() {
   });
 
   // Expose postSuggestion at module scope for auto-suggestions
-  postSuggestion = (content: string) => {
-    addMessageEl("ai", content, "suggestion");
+  postSuggestion = (content: string, edits?: { old_text: string; new_text: string }[]) => {
+    const bubble = addMessageEl("ai", content, "suggestion");
+    if (edits && edits.length > 0 && bubble) {
+      appendEditButtons(bubble, edits);
+    }
   };
 
   showFeedbackIndicator = () => {

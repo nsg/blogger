@@ -706,6 +706,68 @@ html, body {
   letter-spacing: 0.02em;
 }
 
+.apply-fix-container {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+}
+
+.apply-fix-preview {
+  font-size: 11px;
+  line-height: 1.5;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.fix-old {
+  color: #f87171;
+  text-decoration: line-through;
+  opacity: 0.8;
+}
+
+.fix-arrow {
+  color: #6b7280;
+  margin: 0 4px;
+}
+
+.fix-new {
+  color: #34d399;
+}
+
+.apply-fix-btn {
+  display: inline-block;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  color: #e0e0e0;
+  background: rgba(129, 140, 248, 0.15);
+  border: 1px solid rgba(129, 140, 248, 0.3);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.apply-fix-btn:hover:not(:disabled) {
+  background: rgba(129, 140, 248, 0.3);
+  border-color: rgba(129, 140, 248, 0.5);
+}
+
+.apply-fix-btn.applied {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.1);
+  border-color: rgba(52, 211, 153, 0.3);
+  cursor: default;
+}
+
+.apply-fix-btn.failed {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
 /* Mobile */
 @media (max-width: 768px) {
   .pane-left,
