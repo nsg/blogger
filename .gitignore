@@ -4,5 +4,5 @@
 .playwright-output/
 .playwright-mcp/
 .mcp.json
-frontend/dist/main.js
+frontend/dist/*.js
 node_modules/
