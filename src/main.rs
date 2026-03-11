@@ -478,8 +478,79 @@ async fn main() {
     if let Some(path) = args.get(1) {
         let input_path = std::path::Path::new(path);
         if !input_path.exists() {
-            eprintln!("error: path does not exist: {path}");
-            std::process::exit(1);
+            let abs_path = std::path::absolute(input_path).expect("failed to resolve path");
+            let mut blog_root = None;
+            for ancestor in abs_path.ancestors().skip(1) {
+                if ancestor.join("site").is_dir() {
+                    blog_root = Some(ancestor.to_path_buf());
+                    break;
+                }
+                if ancestor.join("config.toml").exists() || ancestor.join("config.yaml").exists() {
+                    blog_root = Some(ancestor.parent().unwrap_or(ancestor).to_path_buf());
+                    break;
+                }
+            }
+            if blog_root.is_none() {
+                eprintln!("error: not inside a Zola site: {path}");
+                std::process::exit(1);
+            }
+
+            let slug = abs_path.file_stem().unwrap_or_default().to_string_lossy();
+            let title: String = slug
+                .split('-')
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+            let front_matter = format!(
+                "+++\ndate = \"{now}\"\ntitle = \"{title}\"\n[taxonomies]\ntags = []\n+++\n"
+            );
+
+            if let Some(parent) = abs_path.parent() {
+                let mut new_dirs = Vec::new();
+                let mut dir = parent;
+                while !dir.exists() {
+                    new_dirs.push(dir.to_path_buf());
+                    dir = match dir.parent() {
+                        Some(p) => p,
+                        None => break,
+                    };
+                }
+                std::fs::create_dir_all(parent).expect("failed to create directories");
+                for d in &new_dirs {
+                    let folder_name = d
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .replace('-', " ");
+                    let folder_title: String = folder_name
+                        .split(' ')
+                        .map(|w| {
+                            let mut c = w.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let index_path = d.join("_index.md");
+                    let index_content =
+                        format!("+++\ntitle = \"{folder_title}\"\nsort_by = \"date\"\n+++\n");
+                    std::fs::write(&index_path, &index_content)
+                        .expect("failed to create _index.md");
+                    println!("created section: {}", index_path.display());
+                }
+            }
+            std::fs::write(&abs_path, &front_matter).expect("failed to create file");
+            println!("created new post: {}", abs_path.display());
         }
 
         let (site_path, file_path) = if input_path.is_file() {
