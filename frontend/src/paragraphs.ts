@@ -140,6 +140,14 @@ export async function requestSuggestion(paragraphId: string) {
     });
     if (!res.ok) { S.setSuggestionInFlight(false); S.setProcessingParagraphId(null); if (S.onProcessingChanged) S.onProcessingChanged(); if (S.hideFeedbackIndicator) S.hideFeedbackIndicator(); return; }
     const data = await res.json();
+
+    const toolLog = data?.tool_log as
+      | { tool: string; args: Record<string, unknown> }[]
+      | undefined;
+    if (toolLog && toolLog.length > 0 && S.postToolLog) {
+      S.postToolLog(toolLog);
+    }
+
     const reply =
       data?.message?.content || data?.choices?.[0]?.message?.content || "";
     const toolCalls = data?.message?.tool_calls as

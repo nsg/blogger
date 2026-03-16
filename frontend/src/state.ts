@@ -18,6 +18,7 @@ export let hideFeedbackIndicator: (() => void) | null = null;
 export let onProcessingChanged: (() => void) | null = null;
 export let getEditorValue: () => string = () => "";
 export let applyEditorEdit: ((oldText: string, newText: string) => boolean) | null = null;
+export let postToolLog: ((entries: { tool: string; args: Record<string, unknown> }[]) => void) | null = null;
 
 export function setCurrentParagraphId(id: string | null) { currentParagraphId = id; }
 export function setAnchorText(text: string | null) { anchorText = text; }
@@ -34,3 +35,4 @@ export function setHideFeedbackIndicator(fn: typeof hideFeedbackIndicator) { hid
 export function setOnProcessingChanged(fn: typeof onProcessingChanged) { onProcessingChanged = fn; }
 export function setGetEditorValue(fn: () => string) { getEditorValue = fn; }
 export function setApplyEditorEdit(fn: typeof applyEditorEdit) { applyEditorEdit = fn; }
+export function setPostToolLog(fn: typeof postToolLog) { postToolLog = fn; }

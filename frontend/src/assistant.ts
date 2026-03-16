@@ -91,6 +91,40 @@ export function initAssistant() {
     return bubble;
   }
 
+  function addToolLog(entries: { tool: string; args: Record<string, unknown> }[]) {
+    for (const entry of entries) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "assistant-msg ai";
+
+      const label = document.createElement("span");
+      label.className = "msg-label";
+      label.textContent = "Tool";
+
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble tool-log";
+
+      const icon = entry.tool === "web_search" ? "\u{1F50D}" : "\u{1F310}";
+      const summary =
+        entry.tool === "web_search"
+          ? (entry.args.query as string) || ""
+          : (entry.args.url as string) || "";
+
+      bubble.innerHTML =
+        `<span class="tool-icon">${icon}</span>` +
+        `<span class="tool-name">${escapeHtml(entry.tool)}</span>` +
+        `<span class="tool-summary">${escapeHtml(summary)}</span>`;
+
+      wrapper.appendChild(label);
+      wrapper.appendChild(bubble);
+      messagesEl.appendChild(wrapper);
+
+      requestAnimationFrame(() => {
+        wrapper.classList.add("visible");
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      });
+    }
+  }
+
   function addTypingIndicator(): HTMLElement {
     const wrapper = document.createElement("div");
     wrapper.className = "assistant-msg ai";
@@ -161,6 +195,14 @@ export function initAssistant() {
       }
 
       const data = await res.json();
+
+      const toolLog = data?.tool_log as
+        | { tool: string; args: Record<string, unknown> }[]
+        | undefined;
+      if (toolLog && toolLog.length > 0) {
+        addToolLog(toolLog);
+      }
+
       const reply =
         data?.message?.content || data?.choices?.[0]?.message?.content || "";
 
@@ -204,6 +246,10 @@ export function initAssistant() {
     if (edits && edits.length > 0 && bubble) {
       appendEditButtons(bubble, edits);
     }
+  });
+
+  S.setPostToolLog((entries) => {
+    addToolLog(entries);
   });
 
   S.setShowFeedbackIndicator(() => {

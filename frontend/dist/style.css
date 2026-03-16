@@ -768,6 +768,39 @@ html, body {
   border-color: rgba(248, 113, 113, 0.3);
 }
 
+/* Tool log entries */
+.msg-bubble.tool-log {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 11px;
+  background: rgba(129, 140, 248, 0.06);
+  border: 1px solid rgba(129, 140, 248, 0.15);
+  color: var(--text-tertiary);
+  border-radius: 6px;
+}
+
+.tool-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.tool-name {
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-indigo);
+  flex-shrink: 0;
+}
+
+.tool-summary {
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Mobile */
 .paragraph-action-icon {
   cursor: pointer;

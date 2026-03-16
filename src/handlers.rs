@@ -43,6 +43,13 @@ async fn ollama_chat(state: &AppState, payload: &Value) -> Result<Value, ApiErr>
     Ok(body)
 }
 
+fn inject_tool_log(mut response: Value, tool_log: Vec<Value>) -> Value {
+    if !tool_log.is_empty() {
+        response["tool_log"] = Value::Array(tool_log);
+    }
+    response
+}
+
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -62,6 +69,7 @@ pub async fn chat(
     let use_tools = body.get("tools").and_then(|t| t.as_bool()).unwrap_or(true);
 
     let mut msgs = messages.as_array().cloned().unwrap_or_default();
+    let mut tool_log: Vec<Value> = Vec::new();
 
     for _ in 0..MAX_TOOL_ROUNDS {
         let mut payload = json!({
@@ -83,7 +91,7 @@ pub async fn chat(
 
         if let Some(calls) = tool_calls {
             if calls.is_empty() {
-                return Ok(Json(response));
+                return Ok(Json(inject_tool_log(response, tool_log)));
             }
 
             let edit_calls: Vec<&Value> = calls
@@ -97,7 +105,7 @@ pub async fn chat(
                 .collect();
 
             if !edit_calls.is_empty() {
-                return Ok(Json(response));
+                return Ok(Json(inject_tool_log(response, tool_log)));
             }
 
             if let Some(msg) = response.get("message") {
@@ -116,6 +124,8 @@ pub async fn chat(
                     .cloned()
                     .unwrap_or(json!({}));
 
+                tool_log.push(json!({ "tool": name, "args": args }));
+
                 let result = exec_tool(&state, name, &args).await;
 
                 msgs.push(json!({
@@ -124,7 +134,7 @@ pub async fn chat(
                 }));
             }
         } else {
-            return Ok(Json(response));
+            return Ok(Json(inject_tool_log(response, tool_log)));
         }
     }
 
@@ -133,7 +143,8 @@ pub async fn chat(
         "messages": msgs,
         "stream": false,
     });
-    ollama_chat(&state, &payload).await.map(Json)
+    let response = ollama_chat(&state, &payload).await?;
+    Ok(Json(inject_tool_log(response, tool_log)))
 }
 
 pub async fn web_search(
