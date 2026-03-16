@@ -22,8 +22,6 @@ pub fn launch_zola_container(site_path: &std::path::Path) -> Result<(), String> 
             "blogger-zola",
             "-p",
             "1111:1111",
-            "-p",
-            "1024:1024",
             "-v",
             &format!("{}:/site:z", canonical.display()),
             "-w",

@@ -177,9 +177,6 @@ export function initMonaco() {
 
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
     let saving = false;
-    let zolaUrl: string | null = null;
-    let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
-    const previewIframe = document.getElementById("ref-iframe") as HTMLIFrameElement | null;
 
     async function autoSave(content: string) {
       if (saving) return;
@@ -190,22 +187,6 @@ export function initMonaco() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ content }),
         });
-        if (previewIframe && previewIframe.src.includes("localhost:1111")) {
-          zolaUrl = previewIframe.src;
-          previewIframe.src = "placeholder.html";
-          if (recoveryTimer) clearTimeout(recoveryTimer);
-          const poll = async (retries: number) => {
-            if (retries <= 0 || !zolaUrl) { previewIframe.src = zolaUrl || ""; return; }
-            try {
-              await fetch(zolaUrl!, { mode: "no-cors" });
-              previewIframe.src = zolaUrl!;
-              zolaUrl = null;
-            } catch {
-              recoveryTimer = setTimeout(() => poll(retries - 1), 400);
-            }
-          };
-          recoveryTimer = setTimeout(() => poll(30), 800);
-        }
       } catch {
         // silently ignore save errors
       }

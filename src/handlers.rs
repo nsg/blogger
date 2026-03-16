@@ -186,6 +186,37 @@ pub async fn web_fetch(
     Ok(Json(result))
 }
 
+pub async fn preview_check(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let base_url = state.preview_url.borrow().clone();
+    let slug = state.initial_file.as_ref().and_then(|(path, _)| {
+        let path_str = path.to_string_lossy();
+        let content_marker = "/content/";
+        let idx = path_str.find(content_marker)?;
+        let relative = &path_str[idx + content_marker.len()..];
+        let stem = relative.strip_suffix(".md").unwrap_or(relative);
+        Some(format!("/{stem}/"))
+    });
+
+    let url = match (&base_url, &slug) {
+        (Some(base), Some(s)) => format!("{}{}", base.trim_end_matches('/'), s),
+        (Some(base), None) => base.clone(),
+        _ => return Json(json!({ "content_length": null })),
+    };
+
+    let cl = state
+        .http
+        .head(&url)
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.headers().get("content-length").cloned())
+        .and_then(|v| v.to_str().ok().map(String::from))
+        .filter(|v| v != "0");
+
+    Json(json!({ "content_length": cl }))
+}
+
 pub async fn preview(State(state): State<Arc<AppState>>) -> Json<Value> {
     let base_url = state.preview_url.borrow().clone();
 

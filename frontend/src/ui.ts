@@ -98,15 +98,18 @@ export async function initPreview() {
   const iframe = document.getElementById("ref-iframe") as HTMLIFrameElement;
   const input = document.getElementById("url-input") as HTMLInputElement;
 
+  let previewUrl: string | null = null;
+
   for (let attempt = 0; attempt < 120; attempt++) {
     try {
       const res = await fetch("/api/preview");
       if (res.ok) {
         const data = await res.json();
         if (data.url) {
+          previewUrl = data.url;
           iframe.src = data.url;
           input.value = data.url;
-          return;
+          break;
         }
       }
     } catch {
@@ -114,4 +117,26 @@ export async function initPreview() {
     }
     await new Promise((r) => setTimeout(r, 500));
   }
+
+  if (!previewUrl) return;
+
+  let lastContentLength: string | null = null;
+
+  setInterval(async () => {
+    try {
+      const res = await fetch("/api/preview-check");
+      if (!res.ok) return;
+      const data = await res.json();
+      const cl = data.content_length as string | null;
+      if (!cl) return;
+      if (lastContentLength === null) {
+        lastContentLength = cl;
+      } else if (cl !== lastContentLength) {
+        lastContentLength = cl;
+        iframe.src = previewUrl!;
+      }
+    } catch {
+      // ignore poll errors
+    }
+  }, 2000);
 }

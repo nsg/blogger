@@ -190,6 +190,7 @@ async fn main() {
         .route("/web_search", post(handlers::web_search))
         .route("/web_fetch", post(handlers::web_fetch))
         .route("/preview", get(handlers::preview))
+        .route("/preview-check", get(handlers::preview_check))
         .route("/initial-content", get(handlers::initial_content))
         .route("/save", post(handlers::save_file));
 
