@@ -345,7 +345,7 @@ export function initMonaco() {
 
       if (hasFile) {
         if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => autoSave(model.getValue()), 20_000);
+        saveTimer = setTimeout(() => autoSave(model.getValue()), 5_000);
       }
 
       if (S.reconcileTimer) clearTimeout(S.reconcileTimer);
