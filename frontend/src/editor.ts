@@ -33,6 +33,108 @@ Happy writing.
 `;
 }
 
+const IMAGE_LINE_RE = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/;
+
+function parseImageLine(line: string): { alt: string; path: string } | null {
+  const m = line.match(IMAGE_LINE_RE);
+  return m ? { alt: m[1], path: m[2] } : null;
+}
+
+function showImageEditDialog(
+  imagePath: string,
+  onRename: (newName: string) => void,
+  onDelete: () => void,
+) {
+  const currentName = imagePath.split("/").pop() || "";
+
+  const overlay = document.createElement("div");
+  overlay.className = "image-dialog-overlay";
+
+  const dialog = document.createElement("div");
+  dialog.className = "image-dialog";
+
+  const label = document.createElement("label");
+  label.className = "image-dialog-label";
+  label.textContent = "Image filename";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "image-dialog-input";
+  input.value = currentName;
+
+  const buttons = document.createElement("div");
+  buttons.className = "image-dialog-buttons";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.className = "image-dialog-btn delete";
+  deleteBtn.textContent = "Delete";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "image-dialog-btn cancel";
+  cancelBtn.textContent = "Cancel";
+
+  const renameBtn = document.createElement("button");
+  renameBtn.className = "image-dialog-btn confirm";
+  renameBtn.textContent = "Rename";
+
+  buttons.appendChild(deleteBtn);
+  buttons.appendChild(cancelBtn);
+  buttons.appendChild(renameBtn);
+  dialog.appendChild(label);
+  dialog.appendChild(input);
+  dialog.appendChild(buttons);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  requestAnimationFrame(() => {
+    overlay.classList.add("visible");
+    input.focus();
+    const dotIdx = input.value.lastIndexOf(".");
+    input.setSelectionRange(0, dotIdx > 0 ? dotIdx : input.value.length);
+  });
+
+  function close() {
+    overlay.classList.remove("visible");
+    setTimeout(() => overlay.remove(), 150);
+  }
+
+  renameBtn.addEventListener("click", () => {
+    const val = input.value.trim();
+    if (val && val !== currentName) {
+      close();
+      onRename(val);
+    } else {
+      close();
+    }
+  });
+
+  cancelBtn.addEventListener("click", close);
+
+  deleteBtn.addEventListener("click", () => {
+    close();
+    onDelete();
+  });
+
+  overlay.addEventListener("mousedown", (e) => {
+    if (e.target === overlay) close();
+  });
+
+  input.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const val = input.value.trim();
+      if (val && val !== currentName) {
+        close();
+        onRename(val);
+      } else {
+        close();
+      }
+    } else if (e.key === "Escape") {
+      close();
+    }
+  });
+}
+
 export function initMonaco() {
   require.config({
     paths: {
@@ -283,13 +385,14 @@ export function initMonaco() {
     function updateGutterIcons() {
       const decorations: IModelDeltaDecoration[] = [];
       for (const [id, para] of S.paragraphMap) {
+        if (para.startLine === para.endLine && parseImageLine(model.getLineContent(para.startLine))) continue;
         const isProcessing = id === S.processingParagraphId;
         const isNop = S.nopParagraphs.has(id);
         let className = "paragraph-action-icon";
         if (isProcessing) className += " paragraph-action-processing";
         else if (isNop) className += " paragraph-action-nop";
         let hoverMsg = "Get AI feedback on this paragraph";
-        if (isProcessing) hoverMsg = "Analyzing paragraph…";
+        if (isProcessing) hoverMsg = "Analyzing paragraph...";
         else if (isNop) hoverMsg = "AI: paragraph looks good";
         decorations.push({
           range: new monaco.Range(para.startLine, 1, para.startLine, 1),
@@ -299,6 +402,19 @@ export function initMonaco() {
           },
         });
       }
+      const lineCount = model.getLineCount();
+      for (let ln = 1; ln <= lineCount; ln++) {
+        const line = model.getLineContent(ln);
+        if (parseImageLine(line)) {
+          decorations.push({
+            range: new monaco.Range(ln, 1, ln, 1),
+            options: {
+              glyphMarginClassName: "image-action-icon",
+              glyphMarginHoverMessage: { value: "Edit image" },
+            },
+          });
+        }
+      }
       gutterDecorations = editor.deltaDecorations(gutterDecorations, decorations);
     }
     updateGutterIcons();
@@ -306,7 +422,44 @@ export function initMonaco() {
 
     editor.onMouseDown((e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => {
       if (e.target.type === 2 && e.target.position) {
-        const paraId = getParagraphAtLine(e.target.position.lineNumber);
+        const ln = e.target.position.lineNumber;
+        const line = model.getLineContent(ln);
+        const img = parseImageLine(line);
+        if (img) {
+          showImageEditDialog(
+            img.path,
+            (newName) => {
+              fetch("/api/rename-image", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ old_path: img.path, new_name: newName }),
+              })
+                .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+                .then((data: { path: string }) => {
+                  const newLine = `![${img.alt}](${data.path})`;
+                  const range = new monaco.Range(ln, 1, ln, line.length + 1);
+                  editor.executeEdits("rename-image", [{ range, text: newLine }]);
+                })
+                .catch(() => {});
+            },
+            () => {
+              fetch("/api/delete-image", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ path: img.path }),
+              })
+                .then(() => {
+                  const startLn = ln > 1 && model.getLineContent(ln - 1).trim() === "" ? ln - 1 : ln;
+                  const endLn = ln < model.getLineCount() && model.getLineContent(ln + 1).trim() === "" ? ln + 1 : ln;
+                  const range = new monaco.Range(startLn, 1, endLn, model.getLineContent(endLn).length + 1);
+                  editor.executeEdits("delete-image", [{ range, text: "" }]);
+                })
+                .catch(() => {});
+            },
+          );
+          return;
+        }
+        const paraId = getParagraphAtLine(ln);
         if (paraId) {
           requestSuggestion(paraId);
         }
@@ -346,6 +499,58 @@ export function initMonaco() {
       }
     });
     resizeObserver.observe(document.getElementById("editor-container")!);
+
+    const editorEl = document.getElementById("editor-container")!;
+    document.addEventListener("paste", (e: Event) => {
+      if (!editorEl.contains(document.activeElement)) return;
+
+      const ce = e as ClipboardEvent;
+      const items = ce.clipboardData?.items;
+      if (!items) return;
+
+      let imageItem: DataTransferItem | null = null;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith("image/")) {
+          imageItem = items[i];
+          break;
+        }
+      }
+      if (!imageItem) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      const file = imageItem.getAsFile();
+      if (!file) return;
+
+      const pos = editor.getPosition();
+      if (!pos) return;
+
+      const ext = file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+      const defaultName = file.name && file.name !== "image.png" ? file.name : `paste.${ext}`;
+
+      const placeholder = "![uploading...]()";
+      const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
+      editor.executeEdits("paste-image", [{ range, text: placeholder }]);
+
+      const form = new FormData();
+      form.append("image", file, defaultName);
+
+      fetch("/api/upload-image", { method: "POST", body: form })
+        .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+        .then((data: { path: string }) => {
+          const mdLink = `![](${data.path})`;
+          const matches = model.findMatches(placeholder, false, false, true, null, true);
+          if (matches.length > 0) {
+            editor.executeEdits("paste-image", [{ range: matches[0].range, text: mdLink }]);
+          }
+        })
+        .catch(() => {
+          const matches = model.findMatches(placeholder, false, false, true, null, true);
+          if (matches.length > 0) {
+            editor.executeEdits("paste-image", [{ range: matches[0].range, text: "![upload failed]()" }]);
+          }
+        });
+    }, { capture: true });
 
     S.setGetEditorValue(() => model.getValue());
     S.setApplyEditorEdit((oldText: string, newText: string): boolean => {

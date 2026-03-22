@@ -134,6 +134,7 @@ async fn main() {
 
     let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
     let mut initial_file: Option<(std::path::PathBuf, String)> = None;
+    let mut site_root: Option<std::path::PathBuf> = None;
 
     if let Some(path) = args.get(1) {
         let input_path = std::path::Path::new(path);
@@ -166,6 +167,8 @@ async fn main() {
             }
         }
 
+        site_root = Some(site_path.clone());
+
         match zola::launch_zola_container(&site_path) {
             Ok(()) => {
                 println!("zola container started, waiting for it to be ready...");
@@ -182,6 +185,7 @@ async fn main() {
         http: reqwest::Client::new(),
         preview_url: preview_rx,
         initial_file,
+        site_root,
     });
 
     let api = Router::new()
@@ -192,7 +196,10 @@ async fn main() {
         .route("/preview", get(handlers::preview))
         .route("/preview-check", get(handlers::preview_check))
         .route("/initial-content", get(handlers::initial_content))
-        .route("/save", post(handlers::save_file));
+        .route("/save", post(handlers::save_file))
+        .route("/upload-image", post(handlers::upload_image))
+        .route("/rename-image", post(handlers::rename_image))
+        .route("/delete-image", post(handlers::delete_image));
 
     let app = Router::new()
         .nest("/api", api)

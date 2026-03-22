@@ -3,4 +3,5 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub preview_url: tokio::sync::watch::Receiver<Option<String>>,
     pub initial_file: Option<(std::path::PathBuf, String)>,
+    pub site_root: Option<std::path::PathBuf>,
 }

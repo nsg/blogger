@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::Multipart, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
@@ -290,6 +290,198 @@ pub async fn save_file(
             Json(json!({ "error": format!("failed to rename file: {e}") })),
         )
     })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn upload_image(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiErr> {
+    let site_root = state.site_root.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no site root configured" })),
+        )
+    })?;
+
+    let field = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid multipart: {e}") })),
+        )
+    })?;
+    let field = field.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no file field" })),
+        )
+    })?;
+
+    let original_name = field.file_name().unwrap_or("paste.png").to_string();
+    let data = field.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("failed to read upload: {e}") })),
+        )
+    })?;
+
+    if data.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty file" })),
+        ));
+    }
+
+    let year = chrono::Local::now().format("%Y").to_string();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let sanitized: String = original_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let filename = format!("{timestamp}-{sanitized}");
+
+    let dir = site_root.join("site/static/images").join(&year);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to create directory: {e}") })),
+        )
+    })?;
+
+    let file_path = dir.join(&filename);
+    std::fs::write(&file_path, &data).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to write image: {e}") })),
+        )
+    })?;
+
+    let markdown_path = format!("/images/{year}/{filename}");
+    Ok(Json(json!({ "path": markdown_path })))
+}
+
+fn resolve_image_path(site_root: &std::path::Path, image_path: &str) -> Option<std::path::PathBuf> {
+    let relative = image_path.strip_prefix('/')?;
+    let full = site_root.join("site/static").join(relative);
+    if !full.starts_with(site_root.join("site/static/images")) {
+        return None;
+    }
+    Some(full)
+}
+
+pub async fn rename_image(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiErr> {
+    let site_root = state.site_root.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no site root configured" })),
+        )
+    })?;
+
+    let old_path = body
+        .get("old_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'old_path'" })),
+            )
+        })?;
+    let new_name = body
+        .get("new_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'new_name'" })),
+            )
+        })?;
+
+    let src = resolve_image_path(site_root, old_path).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        )
+    })?;
+
+    if !src.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "image not found" })),
+        ));
+    }
+
+    let sanitized: String = new_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let dir = src.parent().unwrap();
+    let dest = dir.join(&sanitized);
+    std::fs::rename(&src, &dest).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("rename failed: {e}") })),
+        )
+    })?;
+
+    let parent_name = dir.file_name().unwrap_or_default().to_string_lossy();
+    let new_md_path = format!("/images/{parent_name}/{sanitized}");
+    Ok(Json(json!({ "path": new_md_path })))
+}
+
+pub async fn delete_image(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiErr> {
+    let site_root = state.site_root.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no site root configured" })),
+        )
+    })?;
+
+    let image_path = body.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing 'path'" })),
+        )
+    })?;
+
+    let full = resolve_image_path(site_root, image_path).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        )
+    })?;
+
+    if full.exists() {
+        std::fs::remove_file(&full).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("delete failed: {e}") })),
+            )
+        })?;
+    }
 
     Ok(Json(json!({ "ok": true })))
 }
