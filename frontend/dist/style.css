@@ -92,6 +92,56 @@ html, body {
   transform: translateX(-50%);
 }
 
+.work-pane-tabs {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-light);
+  border-radius: 7px;
+}
+
+.work-pane-tab {
+  position: relative;
+  height: 28px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.work-pane-tab:hover {
+  color: var(--text-primary);
+}
+
+.work-pane-tab.active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+}
+
+.tab-activity-dot {
+  display: none;
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 0 2px var(--bg-inset);
+}
+
+.work-pane-tab.has-activity .tab-activity-dot {
+  display: block;
+}
+
 .topbar-right {
   display: flex;
   align-items: center;
@@ -125,6 +175,10 @@ html, body {
   color: var(--text-on-accent);
 }
 
+.icon-btn[hidden] {
+  display: none;
+}
+
 /* Workspace: 3-pane layout */
 .workspace {
   display: flex;
@@ -153,21 +207,21 @@ html, body {
 }
 
 .pane-left {
-  flex: 0 0 30%;
-  min-width: 900px;
+  flex: 0 0 850px;
+  min-width: 350px;
   background: var(--bg-surface);
   border-right: 1px solid var(--border-light);
 }
 
 .pane-center {
   flex: 1 1 auto;
-  min-width: 300px;
+  min-width: 700px;
   background: #1a1a1a;
 }
 
 .pane-right {
   flex: 0 0 550px;
-  min-width: 550px;
+  min-width: 320px;
   background: var(--bg-surface);
   border-left: 1px solid var(--border-light);
 }
@@ -955,5 +1009,21 @@ html, body {
 
   .pane-center {
     flex: 1;
+  }
+}
+
+@media (max-width: 1440px) and (min-width: 769px) {
+  .work-tabs-active .work-pane-tabs {
+    display: flex;
+  }
+
+  .work-tabs-active .pane-center,
+  .work-tabs-active .pane-right {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .work-tabs-active .pane.tab-hidden {
+    display: none;
   }
 }

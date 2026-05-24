@@ -1,7 +1,7 @@
 import * as S from "./state.js";
 import { initMonaco } from "./editor.js";
 import { initAssistant } from "./assistant.js";
-import { initPaneToggles, initDividerDrag, initUrlBar, initPreview } from "./ui.js";
+import { initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPaneTabs, initUrlBar, initPreview } from "./ui.js";
 
 // Expose debug state for testing
 (window as unknown as Record<string, unknown>).__debug = {
@@ -15,6 +15,8 @@ import { initPaneToggles, initDividerDrag, initUrlBar, initPreview } from "./ui.
 
 initMonaco();
 initPaneToggles();
+initResponsivePreviewPane();
+initWorkPaneTabs();
 initDividerDrag("divider-left", "pane-left", "pane-center");
 initDividerDrag("divider-right", "pane-center", "pane-right");
 initUrlBar();

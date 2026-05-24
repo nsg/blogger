@@ -22,6 +22,172 @@ export function initPaneToggles() {
   });
 }
 
+const BLOG_PREVIEW_WIDTHS = [850, 800, 700, 450, 350];
+const TARGET_EDITOR_WIDTH = 760;
+const MIN_EDITOR_WIDTH = 700;
+const MIN_ASSISTANT_WIDTH = 360;
+const DIVIDER_WIDTH = 4;
+const COMPACT_LAYOUT_WIDTH = 768;
+const TABBED_LAYOUT_WIDTH = 1440;
+const WIDE_ASSISTANT_WIDTH = 550;
+
+function choosePreviewWidth(workspaceWidth: number, rightPaneVisible: boolean) {
+  const reservedWidth =
+    MIN_EDITOR_WIDTH +
+    DIVIDER_WIDTH +
+    (rightPaneVisible ? MIN_ASSISTANT_WIDTH + DIVIDER_WIDTH : 0);
+  const availablePreviewWidth = workspaceWidth - reservedWidth;
+
+  for (const width of BLOG_PREVIEW_WIDTHS) {
+    if (width <= availablePreviewWidth) return width;
+  }
+
+  return BLOG_PREVIEW_WIDTHS[BLOG_PREVIEW_WIDTHS.length - 1];
+}
+
+export function initResponsivePreviewPane() {
+  const workspace = document.querySelector(".workspace") as HTMLElement;
+  const leftPane = document.getElementById("pane-left")!;
+  const rightPane = document.getElementById("pane-right")!;
+  const toggleLeft = document.getElementById("toggle-left")!;
+  const toggleRight = document.getElementById("toggle-right")!;
+
+  function applyPreviewWidth() {
+    if (window.innerWidth <= COMPACT_LAYOUT_WIDTH || leftPane.classList.contains("collapsed")) {
+      return;
+    }
+
+    const workspaceWidth = workspace.getBoundingClientRect().width;
+    const rightPaneVisible = !rightPane.classList.contains("collapsed");
+    const preferredAssistantWidth = rightPaneVisible
+      ? Math.min(WIDE_ASSISTANT_WIDTH, Math.max(MIN_ASSISTANT_WIDTH, workspaceWidth * 0.28))
+      : 0;
+
+    const width = choosePreviewWidth(workspaceWidth, rightPaneVisible);
+
+    leftPane.style.flex = `0 0 ${width}px`;
+    leftPane.dataset.previewWidth = `${width}`;
+
+    if (rightPaneVisible) {
+      const remainingWidth =
+        workspaceWidth - width - TARGET_EDITOR_WIDTH - DIVIDER_WIDTH * 2;
+      const assistantWidth = Math.max(
+        MIN_ASSISTANT_WIDTH,
+        Math.min(preferredAssistantWidth, remainingWidth)
+      );
+      rightPane.style.flex = `0 0 ${assistantWidth}px`;
+    }
+  }
+
+  applyPreviewWidth();
+  window.addEventListener("resize", applyPreviewWidth);
+  toggleLeft.addEventListener("click", applyPreviewWidth);
+  toggleRight.addEventListener("click", applyPreviewWidth);
+}
+
+type WorkPane = "editor" | "assistant";
+
+export function initWorkPaneTabs() {
+  const topbarCenter = document.querySelector(".topbar-center")!;
+  const editorPane = document.getElementById("pane-center")!;
+  const assistantPane = document.getElementById("pane-right")!;
+  const dividerRight = document.getElementById("divider-right")!;
+  const toggleRight = document.getElementById("toggle-right")!;
+  const assistantMessages = document.getElementById("assistant-messages")!;
+
+  let activePane: WorkPane = "editor";
+  let assistantHasActivity = false;
+  let tabbedLayoutActive = false;
+
+  const tabs = document.createElement("div");
+  tabs.className = "work-pane-tabs";
+  tabs.setAttribute("role", "tablist");
+
+  const editorTab = document.createElement("button");
+  editorTab.className = "work-pane-tab active";
+  editorTab.type = "button";
+  editorTab.textContent = "Editor";
+  editorTab.setAttribute("role", "tab");
+  editorTab.setAttribute("aria-selected", "true");
+
+  const assistantTab = document.createElement("button");
+  assistantTab.className = "work-pane-tab";
+  assistantTab.type = "button";
+  assistantTab.textContent = "Assistant";
+  assistantTab.setAttribute("role", "tab");
+  assistantTab.setAttribute("aria-selected", "false");
+
+  const activityDot = document.createElement("span");
+  activityDot.className = "tab-activity-dot";
+  activityDot.setAttribute("aria-hidden", "true");
+  assistantTab.appendChild(activityDot);
+
+  tabs.appendChild(editorTab);
+  tabs.appendChild(assistantTab);
+  topbarCenter.appendChild(tabs);
+
+  function updateTabs() {
+    const assistantActive = activePane === "assistant";
+    editorTab.classList.toggle("active", !assistantActive);
+    assistantTab.classList.toggle("active", assistantActive);
+    assistantTab.classList.toggle("has-activity", assistantHasActivity);
+    editorTab.setAttribute("aria-selected", String(!assistantActive));
+    assistantTab.setAttribute("aria-selected", String(assistantActive));
+  }
+
+  function selectPane(pane: WorkPane) {
+    activePane = pane;
+    if (pane === "assistant") {
+      assistantHasActivity = false;
+    }
+
+    if (tabbedLayoutActive) {
+      editorPane.classList.toggle("tab-hidden", pane !== "editor");
+      assistantPane.classList.toggle("tab-hidden", pane !== "assistant");
+    }
+
+    updateTabs();
+  }
+
+  function applyLayout() {
+    tabbedLayoutActive =
+      window.innerWidth <= TABBED_LAYOUT_WIDTH && window.innerWidth > COMPACT_LAYOUT_WIDTH;
+    document.body.classList.toggle("work-tabs-active", tabbedLayoutActive);
+
+    if (tabbedLayoutActive) {
+      dividerRight.style.display = "none";
+      toggleRight.hidden = true;
+      assistantPane.classList.remove("collapsed");
+      toggleRight.classList.add("active");
+      editorPane.style.flex = "1 1 auto";
+      assistantPane.style.flex = "1 1 auto";
+      selectPane(activePane);
+    } else {
+      dividerRight.style.display = "";
+      toggleRight.hidden = false;
+      editorPane.style.flex = "";
+      editorPane.classList.remove("tab-hidden");
+      assistantPane.classList.remove("tab-hidden");
+      assistantHasActivity = false;
+      updateTabs();
+    }
+  }
+
+  editorTab.addEventListener("click", () => selectPane("editor"));
+  assistantTab.addEventListener("click", () => selectPane("assistant"));
+  window.addEventListener("resize", applyLayout);
+
+  const observer = new MutationObserver(() => {
+    if (tabbedLayoutActive && activePane !== "assistant") {
+      assistantHasActivity = true;
+      updateTabs();
+    }
+  });
+  observer.observe(assistantMessages, { childList: true, subtree: true });
+
+  applyLayout();
+}
+
 export function initDividerDrag(
   dividerId: string,
   leftPaneId: string,
@@ -34,6 +200,8 @@ export function initDividerDrag(
   let dragging = false;
 
   divider.addEventListener("mousedown", (e: MouseEvent) => {
+    if (divider.offsetParent === null) return;
+
     e.preventDefault();
     dragging = true;
     divider.classList.add("dragging");
