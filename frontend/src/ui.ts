@@ -85,23 +85,34 @@ export function initResponsivePreviewPane() {
   toggleRight.addEventListener("click", applyPreviewWidth);
 }
 
-type WorkPane = "editor" | "assistant";
+type WorkPane = "preview" | "editor" | "assistant";
 
 export function initWorkPaneTabs() {
   const topbarCenter = document.querySelector(".topbar-center")!;
+  const previewPane = document.getElementById("pane-left")!;
   const editorPane = document.getElementById("pane-center")!;
   const assistantPane = document.getElementById("pane-right")!;
+  const dividerLeft = document.getElementById("divider-left")!;
   const dividerRight = document.getElementById("divider-right")!;
+  const toggleLeft = document.getElementById("toggle-left")!;
   const toggleRight = document.getElementById("toggle-right")!;
   const assistantMessages = document.getElementById("assistant-messages")!;
 
   let activePane: WorkPane = "editor";
   let assistantHasActivity = false;
   let tabbedLayoutActive = false;
+  let phoneLayoutActive = false;
 
   const tabs = document.createElement("div");
   tabs.className = "work-pane-tabs";
   tabs.setAttribute("role", "tablist");
+
+  const previewTab = document.createElement("button");
+  previewTab.className = "work-pane-tab preview-tab";
+  previewTab.type = "button";
+  previewTab.textContent = "Preview";
+  previewTab.setAttribute("role", "tab");
+  previewTab.setAttribute("aria-selected", "false");
 
   const editorTab = document.createElement("button");
   editorTab.className = "work-pane-tab active";
@@ -122,16 +133,20 @@ export function initWorkPaneTabs() {
   activityDot.setAttribute("aria-hidden", "true");
   assistantTab.appendChild(activityDot);
 
+  tabs.appendChild(previewTab);
   tabs.appendChild(editorTab);
   tabs.appendChild(assistantTab);
   topbarCenter.appendChild(tabs);
 
   function updateTabs() {
+    const previewActive = activePane === "preview";
     const assistantActive = activePane === "assistant";
-    editorTab.classList.toggle("active", !assistantActive);
+    previewTab.classList.toggle("active", previewActive);
+    editorTab.classList.toggle("active", activePane === "editor");
     assistantTab.classList.toggle("active", assistantActive);
     assistantTab.classList.toggle("has-activity", assistantHasActivity);
-    editorTab.setAttribute("aria-selected", String(!assistantActive));
+    previewTab.setAttribute("aria-selected", String(previewActive));
+    editorTab.setAttribute("aria-selected", String(activePane === "editor"));
     assistantTab.setAttribute("aria-selected", String(assistantActive));
   }
 
@@ -142,6 +157,7 @@ export function initWorkPaneTabs() {
     }
 
     if (tabbedLayoutActive) {
+      previewPane.classList.toggle("tab-hidden", phoneLayoutActive && pane !== "preview");
       editorPane.classList.toggle("tab-hidden", pane !== "editor");
       assistantPane.classList.toggle("tab-hidden", pane !== "assistant");
     }
@@ -150,9 +166,10 @@ export function initWorkPaneTabs() {
   }
 
   function applyLayout() {
-    tabbedLayoutActive =
-      window.innerWidth <= TABBED_LAYOUT_WIDTH && window.innerWidth > COMPACT_LAYOUT_WIDTH;
+    tabbedLayoutActive = window.innerWidth <= TABBED_LAYOUT_WIDTH;
+    phoneLayoutActive = window.innerWidth <= COMPACT_LAYOUT_WIDTH;
     document.body.classList.toggle("work-tabs-active", tabbedLayoutActive);
+    document.body.classList.toggle("phone-tabs-active", phoneLayoutActive);
 
     if (tabbedLayoutActive) {
       dividerRight.style.display = "none";
@@ -161,11 +178,28 @@ export function initWorkPaneTabs() {
       toggleRight.classList.add("active");
       editorPane.style.flex = "1 1 auto";
       assistantPane.style.flex = "1 1 auto";
+
+      if (phoneLayoutActive) {
+        dividerLeft.style.display = "none";
+        toggleLeft.hidden = true;
+        previewPane.classList.remove("collapsed");
+        toggleLeft.classList.add("active");
+        previewPane.style.flex = "1 1 auto";
+      } else {
+        dividerLeft.style.display = "";
+        toggleLeft.hidden = false;
+        previewPane.classList.remove("tab-hidden");
+        if (activePane === "preview") activePane = "editor";
+      }
+
       selectPane(activePane);
     } else {
+      dividerLeft.style.display = "";
       dividerRight.style.display = "";
+      toggleLeft.hidden = false;
       toggleRight.hidden = false;
       editorPane.style.flex = "";
+      previewPane.classList.remove("tab-hidden");
       editorPane.classList.remove("tab-hidden");
       assistantPane.classList.remove("tab-hidden");
       assistantHasActivity = false;
@@ -173,6 +207,7 @@ export function initWorkPaneTabs() {
     }
   }
 
+  previewTab.addEventListener("click", () => selectPane("preview"));
   editorTab.addEventListener("click", () => selectPane("editor"));
   assistantTab.addEventListener("click", () => selectPane("assistant"));
   window.addEventListener("resize", applyLayout);

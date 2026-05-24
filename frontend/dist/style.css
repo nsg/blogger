@@ -1007,8 +1007,43 @@ html, body {
     display: none;
   }
 
+  .topbar {
+    padding: 0 10px;
+  }
+
+  .brand-name {
+    display: none;
+  }
+
+  .topbar-center {
+    left: 50%;
+    width: min(72vw, 320px);
+  }
+
+  .work-pane-tabs {
+    width: 100%;
+  }
+
+  .work-pane-tab {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0 6px;
+  }
+
+  .pane-left,
   .pane-center {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .pane-right {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .phone-tabs-active .pane-left:not(.tab-hidden),
+  .phone-tabs-active .pane-right:not(.tab-hidden) {
+    display: flex;
   }
 }
 
@@ -1024,6 +1059,29 @@ html, body {
   }
 
   .work-tabs-active .pane.tab-hidden {
+    display: none;
+  }
+}
+
+@media (max-width: 768px) {
+  .phone-tabs-active .work-pane-tabs {
+    display: flex;
+  }
+
+  .phone-tabs-active .pane-left,
+  .phone-tabs-active .pane-center,
+  .phone-tabs-active .pane-right {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .phone-tabs-active .pane.tab-hidden {
+    display: none;
+  }
+}
+
+@media (min-width: 769px) {
+  .preview-tab {
     display: none;
   }
 }
