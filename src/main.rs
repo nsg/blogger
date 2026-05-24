@@ -207,9 +207,20 @@ async fn main() {
         .fallback(assets::static_handler)
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
-        .await
-        .expect("failed to bind to port 3000");
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:3000").await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("error: Blogger cannot start because port 3000 is already in use");
+            eprintln!("close the other Blogger instance or free port 3000, then try again");
+            zola::stop_zola();
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to bind Blogger web UI to port 3000: {e}");
+            zola::stop_zola();
+            std::process::exit(1);
+        }
+    };
 
     println!("listening on http://localhost:3000");
 
