@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::Multipart, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::Multipart,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
@@ -188,14 +193,7 @@ pub async fn web_fetch(
 
 pub async fn preview_check(State(state): State<Arc<AppState>>) -> Json<Value> {
     let base_url = state.preview_url.borrow().clone();
-    let slug = state.initial_file.as_ref().and_then(|(path, _)| {
-        let path_str = path.to_string_lossy();
-        let content_marker = "/content/";
-        let idx = path_str.find(content_marker)?;
-        let relative = &path_str[idx + content_marker.len()..];
-        let stem = relative.strip_suffix(".md").unwrap_or(relative);
-        Some(format!("/{stem}/"))
-    });
+    let slug = preview_slug(&state);
 
     let url = match (&base_url, &slug) {
         (Some(base), Some(s)) => format!("{}{}", base.trim_end_matches('/'), s),
@@ -217,21 +215,55 @@ pub async fn preview_check(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "content_length": cl }))
 }
 
-pub async fn preview(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let base_url = state.preview_url.borrow().clone();
-
-    let slug = state.initial_file.as_ref().and_then(|(path, _)| {
+fn preview_slug(state: &AppState) -> Option<String> {
+    state.initial_file.as_ref().and_then(|(path, _)| {
         let path_str = path.to_string_lossy();
         let content_marker = "/content/";
         let idx = path_str.find(content_marker)?;
         let relative = &path_str[idx + content_marker.len()..];
         let stem = relative.strip_suffix(".md").unwrap_or(relative);
         Some(format!("/{stem}/"))
-    });
+    })
+}
+
+fn host_with_port(host: &str, port: &str) -> String {
+    if let Some(end) = host.strip_prefix('[').and_then(|h| h.find(']')) {
+        return format!("[{}]:{port}", &host[1..=end]);
+    }
+
+    match host.split_once(':') {
+        Some((name, _)) if !name.is_empty() => format!("{name}:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn public_preview_base_url(base_url: &str, headers: &HeaderMap) -> String {
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return base_url.to_string();
+    };
+
+    if !base_url.starts_with("http://localhost:") && !base_url.starts_with("http://127.0.0.1:") {
+        return base_url.to_string();
+    }
+
+    let Some(port) = base_url.rsplit_once(':').map(|(_, port)| port) else {
+        return base_url.to_string();
+    };
+
+    format!("http://{}", host_with_port(host, port))
+}
+
+pub async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let base_url = state.preview_url.borrow().clone();
+    let slug = preview_slug(&state);
 
     let url = match (&base_url, &slug) {
-        (Some(base), Some(s)) => Some(format!("{}{}", base.trim_end_matches('/'), s)),
-        (Some(base), None) => Some(base.clone()),
+        (Some(base), Some(s)) => Some(format!(
+            "{}{}",
+            public_preview_base_url(base, &headers).trim_end_matches('/'),
+            s
+        )),
+        (Some(base), None) => Some(public_preview_base_url(base, &headers)),
         _ => None,
     };
 
@@ -484,4 +516,36 @@ pub async fn delete_image(
     }
 
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{host_with_port, public_preview_base_url};
+
+    #[test]
+    fn rewrites_localhost_preview_to_request_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("192.168.1.42:3000"));
+
+        let url = public_preview_base_url("http://localhost:1111", &headers);
+
+        assert_eq!(url, "http://192.168.1.42:1111");
+    }
+
+    #[test]
+    fn keeps_non_local_preview_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("192.168.1.42:3000"));
+
+        let url = public_preview_base_url("http://preview.local:1111", &headers);
+
+        assert_eq!(url, "http://preview.local:1111");
+    }
+
+    #[test]
+    fn replaces_ipv6_host_port() {
+        assert_eq!(host_with_port("[::1]:3000", "1111"), "[::1]:1111");
+    }
 }
