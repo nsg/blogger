@@ -8,7 +8,7 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -16,6 +16,9 @@ use axum::{
 use crate::state::{AppState, AuthState};
 
 const AUTH_COOKIE: &str = "blogger_session";
+const KEYRING_SERVICE: &str = "blogger";
+const SESSION_KEYRING_USER: &str = "remote_session_token";
+const SESSION_COOKIE_MAX_AGE_SECS: u64 = 180 * 24 * 60 * 60;
 const PIN_TTL: Duration = Duration::from_secs(120);
 
 fn token_eq(left: &str, right: &str) -> bool {
@@ -58,6 +61,43 @@ fn generate_pin() -> String {
     format!("{value:06}")
 }
 
+fn is_valid_session_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn load_session_token() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, SESSION_KEYRING_USER).ok()?;
+    match entry.get_password() {
+        Ok(token) if is_valid_session_token(&token) => Some(token),
+        Ok(_) => {
+            eprintln!("warning: stored remote session token was invalid; rotating it");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+fn store_session_token(token: &str) {
+    match keyring::Entry::new(KEYRING_SERVICE, SESSION_KEYRING_USER) {
+        Ok(entry) => {
+            if let Err(e) = entry.set_password(token) {
+                eprintln!("warning: failed to persist remote session token in keyring: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: keyring unavailable for remote session token: {e}"),
+    }
+}
+
+fn session_token() -> String {
+    if let Some(token) = load_session_token() {
+        return token;
+    }
+
+    let token = random_hex::<32>();
+    store_session_token(&token);
+    token
+}
+
 pub fn format_pin(pin: &str) -> String {
     pin.as_bytes()
         .chunks(2)
@@ -70,7 +110,7 @@ pub fn new_auth_state() -> AuthState {
     AuthState {
         pin: generate_pin(),
         pin_expires_at: Instant::now() + PIN_TTL,
-        session_token: random_hex::<32>(),
+        session_token: session_token(),
     }
 }
 
@@ -94,10 +134,43 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 }
 
 fn is_localhost_addr(addr: SocketAddr) -> bool {
-    match addr.ip() {
+    is_localhost_ip(addr.ip())
+}
+
+fn is_localhost_ip(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(ip) => ip.is_loopback(),
         IpAddr::V6(ip) => ip.is_loopback(),
     }
+}
+
+fn first_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    first.parse().ok()
+}
+
+fn forwarded_proto_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .next()
+                .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+        })
+}
+
+fn request_is_localhost(request: &Request<Body>) -> bool {
+    if let Some(ip) = first_forwarded_for(request.headers()) {
+        return is_localhost_ip(ip);
+    }
+
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(addr)| is_localhost_addr(*addr))
 }
 
 fn has_session(headers: &axum::http::HeaderMap, session_token: &str) -> bool {
@@ -187,11 +260,17 @@ fn parse_pin(body: &[u8]) -> Option<String> {
     })
 }
 
-fn session_cookie(session_token: &str) -> String {
-    format!("{AUTH_COOKIE}={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
+fn session_cookie(session_token: &str, secure: bool) -> String {
+    let mut cookie = format!(
+        "{AUTH_COOKIE}={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
 }
 
-fn pin_accepted(session_token: &str) -> Response {
+fn pin_accepted(session_token: &str, secure_cookie: bool) -> Response {
     let html = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -221,14 +300,21 @@ fn pin_accepted(session_token: &str) -> Response {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::SET_COOKIE, session_cookie(session_token).as_str()),
+            (
+                header::SET_COOKIE,
+                session_cookie(session_token, secure_cookie).as_str(),
+            ),
         ],
         html,
     )
         .into_response()
 }
 
-pub async fn submit_pin(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+pub async fn submit_pin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let pin_expired = pin_seconds_remaining(&state.auth) == 0;
     let pin_is_valid =
         !pin_expired && parse_pin(&body).is_some_and(|pin| token_eq(&pin, &state.auth.pin));
@@ -247,7 +333,10 @@ pub async fn submit_pin(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
     }
 
     println!("remote PIN accepted; session cookie issued");
-    pin_accepted(&state.auth.session_token)
+    pin_accepted(
+        &state.auth.session_token,
+        forwarded_proto_is_https(&headers),
+    )
 }
 
 pub async fn require_auth(
@@ -260,10 +349,7 @@ pub async fn require_auth(
         return next.run(request).await;
     }
 
-    let is_localhost = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ConnectInfo(addr)| is_localhost_addr(*addr));
+    let is_localhost = request_is_localhost(&request);
 
     if is_localhost || has_session(request.headers(), &state.auth.session_token) {
         return next.run(request).await;
@@ -274,9 +360,13 @@ pub async fn require_auth(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::{format_pin, is_localhost_addr, parse_pin, token_eq};
+    use super::{
+        SESSION_COOKIE_MAX_AGE_SECS, first_forwarded_for, format_pin, forwarded_proto_is_https,
+        is_localhost_addr, is_valid_session_token, parse_pin, session_cookie, token_eq,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn parses_pin_form_body() {
@@ -294,6 +384,61 @@ mod tests {
         assert!(token_eq("abc123", "abc123"));
         assert!(!token_eq("abc123", "abc124"));
         assert!(!token_eq("abc123", "abc1234"));
+    }
+
+    #[test]
+    fn validates_session_token_shape() {
+        assert!(is_valid_session_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_valid_session_token("abc123"));
+        assert!(!is_valid_session_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
+        ));
+    }
+
+    #[test]
+    fn session_cookie_is_persistent() {
+        let cookie = session_cookie(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            false,
+        );
+        assert!(cookie.contains("blogger_session="));
+        assert!(cookie.contains(&format!("Max-Age={SESSION_COOKIE_MAX_AGE_SECS}")));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn secure_session_cookie_is_supported() {
+        let cookie = session_cookie(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            true,
+        );
+        assert!(cookie.ends_with("; Secure"));
+    }
+
+    #[test]
+    fn detects_forwarded_https() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(forwarded_proto_is_https(&headers));
+
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!forwarded_proto_is_https(&headers));
+    }
+
+    #[test]
+    fn parses_first_forwarded_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 127.0.0.1"),
+        );
+        assert_eq!(
+            first_forwarded_for(&headers),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
+        );
     }
 
     #[test]

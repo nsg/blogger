@@ -60,7 +60,9 @@ http://<your-lan-ip>:3000
 
 Localhost access does not require a PIN. Remote browsers must enter the PIN
 within 120 seconds; after that, Blogger stores a persistent HTTP-only session
-cookie. The Zola preview is exposed on `http://<your-lan-ip>:1111`.
+cookie. The server stores the matching session token in the system keyring, so
+authorized browsers remain authorized across Blogger restarts. The Zola preview
+is exposed on `http://<your-lan-ip>:1111`.
 
 ## Requirements
 
@@ -109,13 +111,17 @@ Localhost requests are allowed without authentication. Requests from other
 devices require either:
 
 - a valid `blogger_session` cookie, set automatically after entering the startup
-  PIN in the browser
+  PIN in the browser and retained across Blogger restarts
 - an `Authorization: Bearer <session-token>` header, for scripted access using
   the issued session token
 
-The startup PIN is printed to the terminal and is valid for 120 seconds. Restart
-Blogger to generate a new PIN after it expires. `/api/health` remains
-unauthenticated for health checks.
+The startup PIN is printed to the terminal and is valid for 120 seconds. It is
+only needed for new remote browsers or after the persistent session expires.
+`/api/health` remains unauthenticated for health checks.
+
+When Blogger is behind an HTTPS reverse proxy, configure the proxy to send
+`X-Forwarded-Proto: https`. Blogger uses that header to mark the session cookie
+as `Secure`.
 
 ## Usage
 
