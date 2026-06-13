@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::Multipart,
-    extract::State,
-    http::{HeaderMap, StatusCode, header},
+    extract::{Multipart, Path, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
 
@@ -228,48 +228,105 @@ fn preview_slug(state: &AppState) -> Option<String> {
     })
 }
 
-fn host_with_port(host: &str, port: &str) -> String {
-    if let Some(end) = host.strip_prefix('[').and_then(|h| h.find(']')) {
-        return format!("[{}]:{port}", &host[1..=end]);
-    }
-
-    match host.split_once(':') {
-        Some((name, _)) if !name.is_empty() => format!("{name}:{port}"),
-        _ => format!("{host}:{port}"),
-    }
-}
-
-fn public_preview_base_url(base_url: &str, headers: &HeaderMap) -> String {
-    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
-        return base_url.to_string();
-    };
-
-    if !base_url.starts_with("http://localhost:") && !base_url.starts_with("http://127.0.0.1:") {
-        return base_url.to_string();
-    }
-
-    let Some(port) = base_url.rsplit_once(':').map(|(_, port)| port) else {
-        return base_url.to_string();
-    };
-
-    format!("http://{}", host_with_port(host, port))
-}
-
-pub async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+pub async fn preview(State(state): State<Arc<AppState>>) -> Json<Value> {
     let base_url = state.preview_url.borrow().clone();
     let slug = preview_slug(&state);
 
     let url = match (&base_url, &slug) {
-        (Some(base), Some(s)) => Some(format!(
-            "{}{}",
-            public_preview_base_url(base, &headers).trim_end_matches('/'),
-            s
-        )),
-        (Some(base), None) => Some(public_preview_base_url(base, &headers)),
+        (Some(_), Some(s)) => Some(format!("/preview-site{}", s)),
+        (Some(_), None) => Some("/preview-site/".to_string()),
         _ => None,
     };
 
     Json(json!({ "url": url }))
+}
+
+fn rewrite_preview_html(html: &str) -> String {
+    html.replace("href=\"/", "href=\"/preview-site/")
+        .replace("src=\"/", "src=\"/preview-site/")
+        .replace("action=\"/", "action=\"/preview-site/")
+        .replace("http://localhost:1111", "/preview-site")
+        .replace("http://127.0.0.1:1111", "/preview-site")
+        .replace("//localhost:1111", "/preview-site")
+        .replace("//127.0.0.1:1111", "/preview-site")
+}
+
+fn rewrite_preview_css(css: &str) -> String {
+    css.replace("url(/", "url(/preview-site/")
+        .replace("url('/", "url('/preview-site/")
+        .replace("url(\"/", "url(\"/preview-site/")
+        .replace("http://localhost:1111", "/preview-site")
+        .replace("http://127.0.0.1:1111", "/preview-site")
+        .replace("//localhost:1111", "/preview-site")
+        .replace("//127.0.0.1:1111", "/preview-site")
+}
+
+async fn proxy_preview_path(state: Arc<AppState>, path: &str) -> Response {
+    let path = path.trim_start_matches('/');
+    let url = if path.is_empty() {
+        "http://localhost:1111/".to_string()
+    } else {
+        format!("http://localhost:1111/{path}")
+    };
+
+    let Ok(res) = state.http.get(url).send().await else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "preview unavailable",
+        )
+            .into_response();
+    };
+
+    let status = res.status();
+    let content_type = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let Ok(body) = res.bytes().await else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "failed to read preview response",
+        )
+            .into_response();
+    };
+
+    if content_type.starts_with("text/html") {
+        let html = String::from_utf8_lossy(&body);
+        return (
+            status,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            rewrite_preview_html(&html),
+        )
+            .into_response();
+    }
+
+    if content_type.starts_with("text/css") {
+        let css = String::from_utf8_lossy(&body);
+        return (
+            status,
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            rewrite_preview_css(&css),
+        )
+            .into_response();
+    }
+
+    (status, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+pub async fn preview_site(State(state): State<Arc<AppState>>) -> Response {
+    proxy_preview_path(state, "").await
+}
+
+pub async fn preview_site_path(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    proxy_preview_path(state, &path).await
 }
 
 pub async fn initial_content(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -668,32 +725,30 @@ pub async fn delete_image(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue, header};
-
-    use super::{host_with_port, public_preview_base_url};
+    use super::{rewrite_preview_css, rewrite_preview_html};
 
     #[test]
-    fn rewrites_localhost_preview_to_request_host() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("192.168.1.42:3000"));
+    fn rewrites_preview_asset_urls_to_proxy() {
+        let html = r#"<link rel="stylesheet" href="/style.css"><script src="http://localhost:1111/app.js"></script>"#;
 
-        let url = public_preview_base_url("http://localhost:1111", &headers);
+        let rewritten = rewrite_preview_html(html);
 
-        assert_eq!(url, "http://192.168.1.42:1111");
+        assert!(rewritten.contains(r#"href="/preview-site/style.css""#));
+        assert!(rewritten.contains(r#"src="/preview-site/app.js""#));
+        assert!(!rewritten.contains("localhost:1111"));
+        assert!(!rewritten.contains("/preview-site/preview-site"));
     }
 
     #[test]
-    fn keeps_non_local_preview_url() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("192.168.1.42:3000"));
+    fn rewrites_preview_css_asset_urls_to_proxy() {
+        let css =
+            r#"@font-face{src:url("/fonts/Hanken.ttf")}body{background:url('/images/bg.png')}"#;
 
-        let url = public_preview_base_url("http://preview.local:1111", &headers);
+        let rewritten = rewrite_preview_css(css);
 
-        assert_eq!(url, "http://preview.local:1111");
-    }
-
-    #[test]
-    fn replaces_ipv6_host_port() {
-        assert_eq!(host_with_port("[::1]:3000", "1111"), "[::1]:1111");
+        assert!(rewritten.contains(r#"url("/preview-site/fonts/Hanken.ttf")"#));
+        assert!(rewritten.contains(r#"url('/preview-site/images/bg.png')"#));
+        assert!(!rewritten.contains("url(\"/fonts"));
+        assert!(!rewritten.contains("url('/images"));
     }
 }

@@ -243,6 +243,8 @@ async fn main() {
     let app_state_for_auth = state.clone();
     let app = Router::new()
         .route("/auth/pin", post(auth::submit_pin))
+        .route("/preview-site", get(handlers::preview_site))
+        .route("/preview-site/{*path}", get(handlers::preview_site_path))
         .nest("/api", api)
         .with_state(state)
         .fallback(assets::static_handler)
