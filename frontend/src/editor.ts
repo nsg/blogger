@@ -13,6 +13,8 @@ import {
   requestSuggestion,
 } from "./paragraphs.js";
 
+type AppTheme = "dark" | "light";
+
 function getDefaultContent(): string {
   return `# Welcome to Blogger
 
@@ -135,6 +137,10 @@ function showImageEditDialog(
   });
 }
 
+function getActiveTheme(): AppTheme {
+  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+}
+
 export function initMonaco() {
   require.config({
     paths: {
@@ -164,6 +170,7 @@ export function initMonaco() {
           layout: () => void;
         };
         defineTheme: (name: string, data: Record<string, unknown>) => void;
+        setTheme: (themeName: string) => void;
         MouseTargetType: Record<string, number>;
       };
       languages: {
@@ -212,6 +219,49 @@ export function initMonaco() {
         "editorBracketHighlight.foreground4": "#d4d4d4",
         "editorBracketHighlight.foreground5": "#d4d4d4",
         "editorBracketHighlight.foreground6": "#d4d4d4",
+      },
+    });
+
+    monaco.editor.defineTheme("nexus-light", {
+      base: "vs",
+      inherit: true,
+      rules: [
+        { token: "keyword", foreground: "4f46e5", fontStyle: "bold" },
+        { token: "comment", foreground: "8b8172", fontStyle: "italic" },
+        { token: "string", foreground: "047857" },
+        { token: "number", foreground: "b45309" },
+        { token: "delimiter", foreground: "7c7366" },
+        { token: "tag", foreground: "be185d" },
+        { token: "attribute.name", foreground: "c2410c" },
+        { token: "attribute.value", foreground: "047857" },
+        { token: "type", foreground: "0369a1" },
+        { token: "variable", foreground: "23201c" },
+        { token: "operator", foreground: "be185d" },
+        { token: "string.link", foreground: "6b6258" },
+        { token: "string.escape", foreground: "b45309" },
+        { token: "keyword.markdown", foreground: "4f46e5", fontStyle: "bold" },
+        { token: "string.bold", foreground: "c2410c", fontStyle: "bold" },
+        { token: "string.italic", foreground: "7c3aed", fontStyle: "italic" },
+        { token: "variable.source", foreground: "0891b2" },
+        { token: "frontmatter.delimiter", foreground: "8b8172" },
+        { token: "frontmatter.key", foreground: "c2410c" },
+        { token: "frontmatter.section", foreground: "0369a1" },
+      ],
+      colors: {
+        "editor.background": "#fffdf8",
+        "editor.foreground": "#23201c",
+        "editor.lineHighlightBackground": "#f7f3ea",
+        "editorLineNumber.foreground": "#a99f90",
+        "editorLineNumber.activeForeground": "#5d574e",
+        "editor.selectionBackground": "#4f46e526",
+        "editorCursor.foreground": "#23201c",
+        "editorIndentGuide.background": "#ddd6c7",
+        "editorBracketHighlight.foreground1": "#23201c",
+        "editorBracketHighlight.foreground2": "#23201c",
+        "editorBracketHighlight.foreground3": "#23201c",
+        "editorBracketHighlight.foreground4": "#23201c",
+        "editorBracketHighlight.foreground5": "#23201c",
+        "editorBracketHighlight.foreground6": "#23201c",
       },
     });
 
@@ -300,7 +350,7 @@ export function initMonaco() {
       {
         value: initialContent,
         language: "markdown",
-        theme: "nexus",
+        theme: getActiveTheme() === "light" ? "nexus-light" : "nexus",
         fontFamily: "'Plus Jakarta Sans', sans-serif",
         fontSize: 15,
         lineHeight: 28,
@@ -330,6 +380,11 @@ export function initMonaco() {
 
     const model = editor.getModel();
     const wordCountEl = document.getElementById("word-count")!;
+
+    window.addEventListener("blogger-theme-change", (event: Event) => {
+      const theme = (event as CustomEvent<{ theme: AppTheme }>).detail.theme;
+      monaco.editor.setTheme(theme === "light" ? "nexus-light" : "nexus");
+    });
 
     function updateWordCount() {
       const text = model.getValue();

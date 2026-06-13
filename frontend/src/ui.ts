@@ -1,3 +1,45 @@
+type AppTheme = "dark" | "light";
+
+const THEME_STORAGE_KEY = "blogger-theme";
+
+function getPreferredTheme(): AppTheme {
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  if (stored === "dark" || stored === "light") return stored;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function applyTheme(theme: AppTheme) {
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  window.dispatchEvent(new CustomEvent("blogger-theme-change", { detail: { theme } }));
+}
+
+export function initThemeToggle() {
+  const toggle = document.getElementById("theme-toggle") as HTMLButtonElement | null;
+  const iconSun = document.getElementById("theme-icon-sun");
+  const iconMoon = document.getElementById("theme-icon-moon");
+  let theme = getPreferredTheme();
+
+  function syncToggle() {
+    applyTheme(theme);
+    if (!toggle) return;
+    const isLight = theme === "light";
+    toggle.setAttribute("aria-pressed", String(isLight));
+    toggle.setAttribute("aria-label", isLight ? "Switch to dark mode" : "Switch to light mode");
+    toggle.title = isLight ? "Switch to dark mode" : "Switch to light mode";
+    iconSun?.toggleAttribute("hidden", !isLight);
+    iconMoon?.toggleAttribute("hidden", isLight);
+  }
+
+  syncToggle();
+
+  toggle?.addEventListener("click", () => {
+    theme = theme === "dark" ? "light" : "dark";
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+    syncToggle();
+  });
+}
+
 export function initPaneToggles() {
   const leftPane = document.getElementById("pane-left")!;
   const rightPane = document.getElementById("pane-right")!;

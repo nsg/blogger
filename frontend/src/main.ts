@@ -1,7 +1,7 @@
 import * as S from "./state.js";
 import { initMonaco } from "./editor.js";
 import { initAssistant } from "./assistant.js";
-import { initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPaneTabs, initUrlBar, initPreview } from "./ui.js";
+import { initThemeToggle, initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPaneTabs, initUrlBar, initPreview } from "./ui.js";
 
 // Expose debug state for testing
 (window as unknown as Record<string, unknown>).__debug = {
@@ -13,6 +13,7 @@ import { initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPa
   get canSuggest() { return !S.suggestionInFlight && Date.now() - S.lastSuggestionTime >= 30_000; },
 };
 
+initThemeToggle();
 initMonaco();
 initPaneToggles();
 initResponsivePreviewPane();
