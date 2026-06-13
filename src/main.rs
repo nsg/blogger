@@ -83,17 +83,17 @@ fn create_post(input_path: &std::path::Path) {
 }
 
 const KEYRING_SERVICE: &str = "blogger";
-const KEYRING_USER: &str = "ollama_api_key";
+const OLLAMA_KEYRING_USER: &str = "ollama_api_key";
+const STT_KEYRING_USER: &str = "openai_api_key";
 
-fn get_api_key() -> String {
-    // 1. Environment variable (or .env)
-    if let Ok(key) = std::env::var("OLLAMA_API_KEY")
+fn get_api_key(env_var: &str, keyring_user: &str) -> String {
+    if let Ok(key) = std::env::var(env_var)
         && !key.is_empty()
     {
         return key;
     }
-    // 2. System keyring
-    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+
+    match keyring::Entry::new(KEYRING_SERVICE, keyring_user) {
         Ok(entry) => match entry.get_password() {
             Ok(key) if !key.is_empty() => return key,
             _ => {}
@@ -103,18 +103,19 @@ fn get_api_key() -> String {
     String::new()
 }
 
-fn cmd_set_key() {
-    let key = rpassword::prompt_password("Ollama API key: ").expect("failed to read input");
+fn cmd_set_key(label: &str, keyring_user: &str) {
+    let key =
+        rpassword::prompt_password(format!("{label} API key: ")).expect("failed to read input");
     if key.trim().is_empty() {
         eprintln!("error: empty key");
         std::process::exit(1);
     }
     let entry =
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).expect("failed to access keyring");
+        keyring::Entry::new(KEYRING_SERVICE, keyring_user).expect("failed to access keyring");
     entry
         .set_password(key.trim())
         .expect("failed to store key in keyring");
-    println!("API key stored in system keyring");
+    println!("{label} API key stored in system keyring");
 }
 
 #[tokio::main]
@@ -123,13 +124,23 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("set-key") {
-        cmd_set_key();
+        cmd_set_key("Ollama", OLLAMA_KEYRING_USER);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("set-stt-key") {
+        cmd_set_key("OpenAI STT", STT_KEYRING_USER);
         return;
     }
 
-    let ollama_key = get_api_key();
+    let ollama_key = get_api_key("OLLAMA_API_KEY", OLLAMA_KEYRING_USER);
     if ollama_key.is_empty() {
         eprintln!("warning: no API key found — run `blogger set-key` or set OLLAMA_API_KEY");
+    }
+    let stt_api_key = get_api_key("OPENAI_API_KEY", STT_KEYRING_USER);
+    if stt_api_key.is_empty() {
+        eprintln!(
+            "warning: no STT API key found — run `blogger set-stt-key` or set OPENAI_API_KEY"
+        );
     }
 
     let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
@@ -182,6 +193,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         ollama_key,
+        stt_api_key,
         http: reqwest::Client::new(),
         preview_url: preview_rx,
         initial_file,
@@ -197,6 +209,7 @@ async fn main() {
         .route("/preview-check", get(handlers::preview_check))
         .route("/initial-content", get(handlers::initial_content))
         .route("/save", post(handlers::save_file))
+        .route("/transcribe", post(handlers::transcribe))
         .route("/upload-image", post(handlers::upload_image))
         .route("/rename-image", post(handlers::rename_image))
         .route("/delete-image", post(handlers::delete_image));
@@ -205,7 +218,7 @@ async fn main() {
         .nest("/api", api)
         .with_state(state)
         .fallback(assets::static_handler)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024));
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
 
     let listener = match tokio::net::TcpListener::bind("0.0.0.0:3000").await {
         Ok(listener) => listener,

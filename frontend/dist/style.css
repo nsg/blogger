@@ -321,6 +321,50 @@ html, body {
   color: var(--text-tertiary);
 }
 
+.editor-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.voice-status {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.voice-btn {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+}
+
+.voice-btn.recording {
+  border-color: var(--danger-border-hover);
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.voice-btn.transcribing {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  cursor: wait;
+}
+
+.voice-btn.transcribing svg {
+  animation: voicePulse 1s ease-in-out infinite;
+}
+
+@keyframes voicePulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 .pane-content {
   flex: 1;
   min-height: 0;

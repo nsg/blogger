@@ -167,6 +167,7 @@ export function initMonaco() {
           onMouseDown: (cb: (e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => void) => void;
           deltaDecorations: (oldDecorations: string[], newDecorations: IModelDeltaDecoration[]) => string[];
           executeEdits: (source: string, edits: { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number }; text: string }[]) => void;
+          focus: () => void;
           layout: () => void;
         };
         defineTheme: (name: string, data: Record<string, unknown>) => void;
@@ -380,11 +381,154 @@ export function initMonaco() {
 
     const model = editor.getModel();
     const wordCountEl = document.getElementById("word-count")!;
+    const voiceBtn = document.getElementById("voice-record") as HTMLButtonElement | null;
+    const voiceStatus = document.getElementById("voice-status");
 
     window.addEventListener("blogger-theme-change", (event: Event) => {
       const theme = (event as CustomEvent<{ theme: AppTheme }>).detail.theme;
       monaco.editor.setTheme(theme === "light" ? "nexus-light" : "nexus");
     });
+
+    function setVoiceStatus(message: string) {
+      if (voiceStatus) voiceStatus.textContent = message;
+    }
+
+    function chooseRecordingMimeType(): string {
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/mpeg",
+      ];
+      return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+    }
+
+    function recordingExtension(mimeType: string): string {
+      if (mimeType.includes("mp4")) return "m4a";
+      if (mimeType.includes("mpeg")) return "mp3";
+      return "webm";
+    }
+
+    function insertTranscript(text: string) {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+
+      const pos = editor.getPosition();
+      if (!pos) return;
+
+      const line = model.getLineContent(pos.lineNumber);
+      const before = line.slice(0, Math.max(0, pos.column - 1));
+      const after = line.slice(Math.max(0, pos.column - 1));
+      const prefix = before && !/\s$/.test(before) && !/^[.,!?;:)]/.test(trimmed) ? " " : "";
+      const suffix = after && !/^\s/.test(after) && !/[([{]$/.test(trimmed) ? " " : "";
+      const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
+
+      editor.executeEdits("voice-dictation", [{ range, text: `${prefix}${trimmed}${suffix}` }]);
+      editor.focus();
+    }
+
+    function initVoiceInput() {
+      if (!voiceBtn) return;
+      const button = voiceBtn;
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        button.disabled = true;
+        button.title = "Dictation is not supported in this browser";
+        button.setAttribute("aria-label", "Dictation is not supported in this browser");
+        return;
+      }
+
+      let recorder: MediaRecorder | null = null;
+      let stream: MediaStream | null = null;
+      let chunks: Blob[] = [];
+
+      async function transcribe(blob: Blob, mimeType: string) {
+        button.disabled = true;
+        button.classList.remove("recording");
+        button.classList.add("transcribing");
+        setVoiceStatus("Transcribing...");
+
+        try {
+          const form = new FormData();
+          form.append("audio", blob, `dictation.${recordingExtension(mimeType)}`);
+          const res = await fetch("/api/transcribe", { method: "POST", body: form });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.error || "Transcription failed");
+          }
+          insertTranscript(typeof data.text === "string" ? data.text : "");
+          setVoiceStatus("");
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Transcription failed";
+          setVoiceStatus(message);
+        } finally {
+          button.disabled = false;
+          button.classList.remove("transcribing");
+          button.title = "Start dictation";
+          button.setAttribute("aria-label", "Start dictation");
+        }
+      }
+
+      function resetRecordingUi() {
+        button.classList.remove("recording");
+        button.querySelector(".voice-icon-mic")?.removeAttribute("hidden");
+        button.querySelector(".voice-icon-stop")?.setAttribute("hidden", "");
+      }
+
+      function stopRecording() {
+        if (recorder && recorder.state !== "inactive") {
+          recorder.stop();
+        }
+      }
+
+      async function startRecording() {
+        chunks = [];
+        const mimeType = chooseRecordingMimeType();
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+        recorder.addEventListener("dataavailable", (event: BlobEvent) => {
+          if (event.data.size > 0) chunks.push(event.data);
+        });
+
+        recorder.addEventListener("stop", () => {
+          stream?.getTracks().forEach((track) => track.stop());
+          stream = null;
+          resetRecordingUi();
+
+          const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+          chunks = [];
+          if (blob.size === 0) {
+            setVoiceStatus("");
+            return;
+          }
+          void transcribe(blob, mimeType || "audio/webm");
+        });
+
+        recorder.start();
+        button.classList.add("recording");
+        button.title = "Stop dictation";
+        button.setAttribute("aria-label", "Stop dictation");
+        button.querySelector(".voice-icon-mic")?.setAttribute("hidden", "");
+        button.querySelector(".voice-icon-stop")?.removeAttribute("hidden");
+        setVoiceStatus("Recording");
+      }
+
+      button.addEventListener("click", () => {
+        if (recorder && recorder.state === "recording") {
+          stopRecording();
+          return;
+        }
+
+        startRecording().catch((err) => {
+          stream?.getTracks().forEach((track) => track.stop());
+          stream = null;
+          recorder = null;
+          resetRecordingUi();
+          const message = err instanceof Error ? err.message : "Could not start dictation";
+          setVoiceStatus(message);
+        });
+      });
+    }
 
     function updateWordCount() {
       const text = model.getValue();
@@ -427,6 +571,7 @@ export function initMonaco() {
       }, 300));
     });
     updateWordCount();
+    initVoiceInput();
 
     reconcileParagraphs(model);
     const initPos = editor.getPosition();

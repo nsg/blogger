@@ -13,6 +13,7 @@ Blogger is a local writing tool that combines a Monaco editor, an AI assistant, 
 
 - **Monaco editor** with Zola front matter syntax highlighting and word count
 - **AI writing assistant** with paragraph-level feedback and "Apply fix" buttons
+- **Voice dictation** — record from the editor and insert transcribed text at the cursor
 - **Live Zola preview** rendered in a side pane via Podman
 - **Web search and fetch** — the AI can look things up while helping you write
 - **Auto-save** with atomic writes so Zola never sees a truncated file
@@ -32,6 +33,9 @@ git clone <repo-url> && cd blogger
 # Store your Ollama API key in the system keyring
 blogger set-key
 
+# Store your OpenAI STT API key for voice dictation
+blogger set-stt-key
+
 # Open an existing post
 blogger ~/blog/site/content/posts/my-post.md
 
@@ -50,7 +54,7 @@ Open `http://localhost:3000` in your browser.
 
 ## Configuration
 
-### API Key
+### API Keys
 
 Store your Ollama API key securely in the system keyring:
 
@@ -63,11 +67,23 @@ The key is looked up in this order:
 1. `OLLAMA_API_KEY` environment variable (or `.env` file)
 2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
 
+Voice dictation uses OpenAI speech-to-text. Store that key separately:
+
+```bash
+blogger set-stt-key
+```
+
+The STT key is looked up in this order:
+
+1. `OPENAI_API_KEY` environment variable (or `.env` file)
+2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
+
 ## Usage
 
 ```
 blogger [PATH]
 blogger set-key
+blogger set-stt-key
 ```
 
 **PATH** can be:

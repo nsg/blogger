@@ -12,6 +12,8 @@ use crate::state::AppState;
 use crate::tools::{exec_tool, web_tools};
 
 const MAX_TOOL_ROUNDS: usize = 6;
+const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const STT_MODEL: &str = "gpt-4o-transcribe";
 
 type ApiErr = (StatusCode, Json<Value>);
 
@@ -324,6 +326,137 @@ pub async fn save_file(
     })?;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+fn multipart_boundary() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("blogger-stt-{nanos}-{}", std::process::id())
+}
+
+fn clean_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '"' | '\r' | '\n' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
+fn append_form_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(b"\r\n");
+}
+
+fn build_transcription_body(
+    boundary: &str,
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(data.len() + 512);
+    append_form_field(&mut body, boundary, "model", STT_MODEL);
+    append_form_field(&mut body, boundary, "response_format", "json");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+            clean_header_value(filename)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!("Content-Type: {}\r\n\r\n", clean_header_value(content_type)).as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+pub async fn transcribe(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiErr> {
+    if state.stt_api_key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "missing STT API key; run `blogger set-stt-key` or set OPENAI_API_KEY" }),
+            ),
+        ));
+    }
+
+    let field = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid multipart: {e}") })),
+        )
+    })?;
+    let field = field.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no audio field" })),
+        )
+    })?;
+
+    let filename = field.file_name().unwrap_or("dictation.webm").to_string();
+    let content_type = field.content_type().unwrap_or("audio/webm").to_string();
+    let data = field.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("failed to read audio: {e}") })),
+        )
+    })?;
+
+    if data.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty audio" })),
+        ));
+    }
+
+    let boundary = multipart_boundary();
+    let body = build_transcription_body(&boundary, &filename, &content_type, &data);
+    let res = state
+        .http
+        .post(OPENAI_TRANSCRIPTIONS_URL)
+        .bearer_auth(&state.stt_api_key)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| bad_gateway(format!("Transcription request failed: {e}")))?;
+
+    let status = res.status();
+    let body: Value = res
+        .json()
+        .await
+        .map_err(|e| bad_gateway(format!("Failed to parse transcription response: {e}")))?;
+
+    if !status.is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("Transcription returned {status}"), "detail": body })),
+        ));
+    }
+
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    Ok(Json(json!({ "text": text })))
 }
 
 pub async fn upload_image(
