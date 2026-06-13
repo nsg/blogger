@@ -45,6 +45,23 @@ blogger ~/blog/site/content/posts/new-post.md
 
 Open `http://localhost:3000` in your browser.
 
+To use Blogger from another device on your local network, start it normally and
+copy the short PIN printed in the terminal:
+
+```bash
+blogger ~/blog/site/content/posts/my-post.md
+```
+
+Then visit the machine's LAN address:
+
+```text
+http://<your-lan-ip>:3000
+```
+
+Localhost access does not require a PIN. Remote browsers must enter the PIN
+within 120 seconds; after that, Blogger stores a persistent HTTP-only session
+cookie. The Zola preview is exposed on `http://<your-lan-ip>:1111`.
+
 ## Requirements
 
 - **Rust** toolchain (for building)
@@ -77,6 +94,28 @@ The STT key is looked up in this order:
 
 1. `OPENAI_API_KEY` environment variable (or `.env` file)
 2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
+
+### Local Network Access
+
+Blogger binds the web UI to `0.0.0.0:3000`, and the Zola preview container is
+published on `0.0.0.0:1111`. Use your machine's LAN address from another
+device:
+
+```bash
+hostname -I
+```
+
+Localhost requests are allowed without authentication. Requests from other
+devices require either:
+
+- a valid `blogger_session` cookie, set automatically after entering the startup
+  PIN in the browser
+- an `Authorization: Bearer <session-token>` header, for scripted access using
+  the issued session token
+
+The startup PIN is printed to the terminal and is valid for 120 seconds. Restart
+Blogger to generate a new PIN after it expires. `/api/health` remains
+unauthenticated for health checks.
 
 ## Usage
 

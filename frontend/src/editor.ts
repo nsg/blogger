@@ -158,6 +158,7 @@ export function initMonaco() {
           getModel: () => {
             onDidChangeContent: (cb: () => void) => void;
             getValue: () => string;
+            setValue: (value: string) => void;
             getLineCount: () => number;
             getLineContent: (lineNumber: number) => string;
             findMatches: (searchString: string, searchOnlyEditableRange: boolean, isRegex: boolean, matchCase: boolean, wordSeparators: string | null, captureMatches: boolean) => { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number } }[];
@@ -315,13 +316,19 @@ export function initMonaco() {
 
     let initialContent = getDefaultContent();
     let hasFile = false;
+    let canSync = false;
+    let documentRevision = 0;
     try {
       const res = await fetch("/api/initial-content");
       if (res.ok) {
         const data = await res.json();
-        if (data.content) {
+        if (data.path !== null && typeof data.content === "string") {
           initialContent = data.content;
           hasFile = true;
+        }
+        if (typeof data.revision === "number") {
+          documentRevision = data.revision;
+          canSync = true;
         }
       }
     } catch {
@@ -330,20 +337,36 @@ export function initMonaco() {
 
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
     let saving = false;
+    let localDirty = false;
+    let applyingRemoteContent = false;
+    let lastSavedContent = initialContent;
 
     async function autoSave(content: string) {
       if (saving) return;
       saving = true;
       try {
-        await fetch("/api/save", {
+        const res = await fetch("/api/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify({ content, revision: documentRevision }),
         });
+        if (res.ok) {
+          const data = await res.json();
+          if (typeof data.revision === "number") {
+            documentRevision = data.revision;
+          }
+          lastSavedContent = content;
+          localDirty = model.getValue() !== content;
+        }
       } catch {
         // silently ignore save errors
       }
       saving = false;
+
+      if (canSync && localDirty && model.getValue() !== lastSavedContent) {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => autoSave(model.getValue()), 1_000);
+      }
     }
 
     const editor = monaco.editor.create(
@@ -542,7 +565,8 @@ export function initMonaco() {
     model.onDidChangeContent(() => {
       updateWordCount();
 
-      if (hasFile) {
+      if (canSync && !applyingRemoteContent) {
+        localDirty = true;
         if (saveTimer) clearTimeout(saveTimer);
         saveTimer = setTimeout(() => autoSave(model.getValue()), 5_000);
       }
@@ -572,6 +596,34 @@ export function initMonaco() {
     });
     updateWordCount();
     initVoiceInput();
+
+    async function pollDocumentState() {
+      if (!canSync || localDirty || saving) return;
+
+      try {
+        const res = await fetch("/api/document-state");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (typeof data.revision !== "number" || data.revision <= documentRevision) return;
+        if (typeof data.content !== "string" || data.content === model.getValue()) {
+          documentRevision = data.revision;
+          return;
+        }
+
+        applyingRemoteContent = true;
+        model.setValue(data.content);
+        applyingRemoteContent = false;
+        documentRevision = data.revision;
+        lastSavedContent = data.content;
+        localDirty = false;
+      } catch {
+        // keep the local editor usable if polling fails
+      } finally {
+        applyingRemoteContent = false;
+      }
+    }
+
+    setInterval(pollDocumentState, 2_000);
 
     reconcileParagraphs(model);
     const initPos = editor.getPosition();

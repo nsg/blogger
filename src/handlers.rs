@@ -273,31 +273,39 @@ pub async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 }
 
 pub async fn initial_content(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let document = state.document.read().await;
     match &state.initial_file {
-        Some((path, _)) => {
-            let content = std::fs::read_to_string(path).unwrap_or_default();
-            Json(json!({
-                "path": path.display().to_string(),
-                "content": content,
-            }))
-        }
-        None => Json(json!({ "path": null, "content": null })),
+        Some((path, _)) => Json(json!({
+            "path": path.display().to_string(),
+            "content": document.content.clone(),
+            "revision": document.revision,
+        })),
+        None => Json(json!({
+            "path": null,
+            "content": if document.revision > 1 {
+                Value::String(document.content.clone())
+            } else {
+                Value::Null
+            },
+            "revision": document.revision,
+        })),
     }
+}
+
+pub async fn document_state(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let document = state.document.read().await;
+    Json(json!({
+        "content": document.content.clone(),
+        "revision": document.revision,
+        "has_file": state.initial_file.is_some(),
+    }))
 }
 
 pub async fn save_file(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
-    let path = match &state.initial_file {
-        Some((path, _)) => path,
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "no file loaded" })),
-            ));
-        }
-    };
+    let path = state.initial_file.as_ref().map(|(path, _)| path.clone());
 
     let content = body
         .get("content")
@@ -309,23 +317,30 @@ pub async fn save_file(
             )
         })?;
 
-    let dir = path.parent().unwrap_or(std::path::Path::new("."));
-    let tmp = dir.join(format!(".blogger-save-{}.tmp", std::process::id()));
-    std::fs::write(&tmp, content).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to write temp file: {e}") })),
-        )
-    })?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to rename file: {e}") })),
-        )
-    })?;
+    if let Some(path) = path {
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let tmp = dir.join(format!(".blogger-save-{}.tmp", std::process::id()));
+        std::fs::write(&tmp, content).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to write temp file: {e}") })),
+            )
+        })?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to rename file: {e}") })),
+            )
+        })?;
+    }
 
-    Ok(Json(json!({ "ok": true })))
+    let mut document = state.document.write().await;
+    document.content = content.to_string();
+    document.revision += 1;
+    let revision = document.revision;
+
+    Ok(Json(json!({ "ok": true, "revision": revision })))
 }
 
 fn multipart_boundary() -> String {

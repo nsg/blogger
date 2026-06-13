@@ -1,18 +1,20 @@
 mod assets;
+mod auth;
 mod handlers;
 mod state;
 mod tools;
 mod zola;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
 };
 
-use state::AppState;
+use state::{AppState, DocumentState};
 
 fn slug_to_title(slug: &str) -> String {
     slug.split('-')
@@ -118,6 +120,12 @@ fn cmd_set_key(label: &str, keyring_user: &str) {
     println!("{label} API key stored in system keyring");
 }
 
+fn local_lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("8.8.8.8", 80)).ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -142,6 +150,13 @@ async fn main() {
             "warning: no STT API key found — run `blogger set-stt-key` or set OPENAI_API_KEY"
         );
     }
+    let auth = auth::new_auth_state();
+    println!(
+        "remote access PIN: \x1b[1m{}\x1b[0m (valid for {} seconds)",
+        auth::format_pin(&auth.pin),
+        auth::pin_seconds_remaining(&auth)
+    );
+    println!("localhost requests do not require the PIN");
 
     let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
     let mut initial_file: Option<(std::path::PathBuf, String)> = None;
@@ -191,13 +206,23 @@ async fn main() {
         }
     }
 
+    let document_content = initial_file
+        .as_ref()
+        .map(|(_, content)| content.clone())
+        .unwrap_or_default();
+
     let state = Arc::new(AppState {
         ollama_key,
         stt_api_key,
+        auth,
         http: reqwest::Client::new(),
         preview_url: preview_rx,
         initial_file,
         site_root,
+        document: tokio::sync::RwLock::new(DocumentState {
+            content: document_content,
+            revision: 1,
+        }),
     });
 
     let api = Router::new()
@@ -208,17 +233,24 @@ async fn main() {
         .route("/preview", get(handlers::preview))
         .route("/preview-check", get(handlers::preview_check))
         .route("/initial-content", get(handlers::initial_content))
+        .route("/document-state", get(handlers::document_state))
         .route("/save", post(handlers::save_file))
         .route("/transcribe", post(handlers::transcribe))
         .route("/upload-image", post(handlers::upload_image))
         .route("/rename-image", post(handlers::rename_image))
         .route("/delete-image", post(handlers::delete_image));
 
+    let app_state_for_auth = state.clone();
     let app = Router::new()
+        .route("/auth/pin", post(auth::submit_pin))
         .nest("/api", api)
         .with_state(state)
         .fallback(assets::static_handler)
-        .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            app_state_for_auth.clone(),
+            auth::require_auth,
+        ));
 
     let listener = match tokio::net::TcpListener::bind("0.0.0.0:3000").await {
         Ok(listener) => listener,
@@ -235,7 +267,12 @@ async fn main() {
         }
     };
 
-    println!("listening on http://localhost:3000");
+    println!("listening on 0.0.0.0:3000");
+    println!("local access: http://localhost:3000");
+    match local_lan_ip() {
+        Some(ip) => println!("network access: http://{ip}:3000"),
+        None => println!("network access: http://<lan-ip>:3000"),
+    }
 
     let shutdown = async {
         tokio::signal::ctrl_c().await.ok();
@@ -243,8 +280,11 @@ async fn main() {
         zola::stop_zola();
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .expect("server error");
 }
