@@ -14,6 +14,7 @@ import {
 } from "./paragraphs.js";
 
 type AppTheme = "dark" | "light";
+type AudioContextWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
 function getDefaultContent(): string {
   return `# Welcome to Blogger
@@ -369,8 +370,9 @@ export function initMonaco() {
       }
     }
 
+    const editorContainer = document.getElementById("editor-container")!;
     const editor = monaco.editor.create(
-      document.getElementById("editor-container")!,
+      editorContainer,
       {
         value: initialContent,
         language: "markdown",
@@ -389,7 +391,7 @@ export function initMonaco() {
         lineDecorationsWidth: 0,
         renderLineHighlight: "all",
         scrollBeyondLastLine: false,
-        padding: { top: 20, bottom: 20 },
+        padding: { top: 20, bottom: 112 },
         overviewRulerLanes: 0,
         hideCursorInOverviewRuler: true,
         scrollbar: {
@@ -406,6 +408,23 @@ export function initMonaco() {
     const wordCountEl = document.getElementById("word-count")!;
     const voiceBtn = document.getElementById("voice-record") as HTMLButtonElement | null;
     const voiceStatus = document.getElementById("voice-status");
+    const voiceVisualizer = document.getElementById("voice-visualizer") as HTMLElement | null;
+    if (voiceVisualizer && voiceVisualizer.parentElement !== editorContainer) {
+      editorContainer.appendChild(voiceVisualizer);
+    }
+
+    function syncVoiceViewportInset() {
+      const viewport = window.visualViewport;
+      const bottomInset = viewport
+        ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop)
+        : 0;
+      editorContainer.style.setProperty("--voice-bottom-inset", `${Math.ceil(bottomInset)}px`);
+    }
+
+    syncVoiceViewportInset();
+    window.visualViewport?.addEventListener("resize", syncVoiceViewportInset);
+    window.visualViewport?.addEventListener("scroll", syncVoiceViewportInset);
+    window.addEventListener("resize", syncVoiceViewportInset);
 
     window.addEventListener("blogger-theme-change", (event: Event) => {
       const theme = (event as CustomEvent<{ theme: AppTheme }>).detail.theme;
@@ -463,6 +482,128 @@ export function initMonaco() {
       let recorder: MediaRecorder | null = null;
       let stream: MediaStream | null = null;
       let chunks: Blob[] = [];
+      let audioContext: AudioContext | null = null;
+      let analyser: AnalyserNode | null = null;
+      let sourceNode: MediaStreamAudioSourceNode | null = null;
+      let voiceFrame: number | null = null;
+      let timeData: Uint8Array<ArrayBuffer> | null = null;
+      const voiceBars = voiceVisualizer
+        ? Array.from(voiceVisualizer.querySelectorAll<HTMLElement>(".voice-wave-bar"))
+        : [];
+
+      function getAudioContextCtor() {
+        return window.AudioContext || (window as AudioContextWindow).webkitAudioContext;
+      }
+
+      function primeVoiceAudioContext() {
+        if (!voiceVisualizer || voiceBars.length === 0 || audioContext) return;
+        const AudioContextCtor = getAudioContextCtor();
+        if (!AudioContextCtor) return;
+
+        audioContext = new AudioContextCtor();
+        void audioContext.resume();
+      }
+
+      function setVoiceVisualizerActive(active: boolean) {
+        voiceVisualizer?.classList.toggle("active", active);
+        voiceVisualizer?.classList.toggle("analyzing", false);
+        if (!active) {
+          voiceVisualizer?.style.setProperty("--voice-level", "0");
+          voiceBars.forEach((bar) => bar.style.setProperty("--level", "0.12"));
+        }
+      }
+
+      function stopVoiceVisualizer() {
+        if (voiceFrame !== null) {
+          cancelAnimationFrame(voiceFrame);
+          voiceFrame = null;
+        }
+        sourceNode?.disconnect();
+        sourceNode = null;
+        analyser = null;
+        timeData = null;
+        void audioContext?.close();
+        audioContext = null;
+        setVoiceVisualizerActive(false);
+      }
+
+      async function startVoiceVisualizer(inputStream: MediaStream): Promise<boolean> {
+        if (voiceFrame !== null) {
+          cancelAnimationFrame(voiceFrame);
+          voiceFrame = null;
+        }
+        sourceNode?.disconnect();
+        sourceNode = null;
+        analyser = null;
+        timeData = null;
+        setVoiceVisualizerActive(false);
+
+        if (!voiceVisualizer || voiceBars.length === 0) return false;
+
+        const AudioContextCtor = getAudioContextCtor();
+        if (!AudioContextCtor) return false;
+
+        try {
+          if (!audioContext) audioContext = new AudioContextCtor();
+          await audioContext.resume();
+          if (audioContext.state !== "running") {
+            await new Promise<void>((resolve) => {
+              const timeout = window.setTimeout(resolve, 250);
+              audioContext?.addEventListener("statechange", () => {
+                window.clearTimeout(timeout);
+                resolve();
+              }, { once: true });
+            });
+          }
+
+          if (audioContext.state !== "running") return false;
+
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.74;
+          sourceNode = audioContext.createMediaStreamSource(inputStream);
+          sourceNode.connect(analyser);
+          timeData = new Uint8Array(analyser.fftSize);
+          setVoiceVisualizerActive(true);
+          voiceVisualizer.classList.add("analyzing");
+        } catch {
+          stopVoiceVisualizer();
+          return false;
+        }
+
+        const tick = () => {
+          if (!analyser || !timeData) return;
+          const data = timeData;
+
+          analyser.getByteTimeDomainData(data);
+          let sumSquares = 0;
+          for (let i = 0; i < data.length; i += 1) {
+            const centered = (data[i] - 128) / 128;
+            sumSquares += centered * centered;
+          }
+          const rms = Math.sqrt(sumSquares / data.length);
+          const level = Math.min(1, Math.max(0.03, rms * 7.5));
+          voiceVisualizer.style.setProperty("--voice-level", level.toFixed(3));
+
+          const binWidth = Math.max(1, Math.floor(data.length / voiceBars.length));
+          voiceBars.forEach((bar, index) => {
+            const start = index * binWidth;
+            const end = Math.min(data.length, start + binWidth);
+            let peak = 0;
+            for (let i = start; i < end; i += 1) {
+              peak = Math.max(peak, Math.abs((data[i] - 128) / 128));
+            }
+            const mirrored = 1 - Math.abs(index - (voiceBars.length - 1) / 2) / ((voiceBars.length - 1) / 2);
+            const shaped = Math.min(1, 0.08 + peak * 2.2 + level * 0.52 + mirrored * level * 0.28);
+            bar.style.setProperty("--level", shaped.toFixed(3));
+          });
+
+          voiceFrame = requestAnimationFrame(tick);
+        };
+
+        tick();
+        return true;
+      }
 
       async function transcribe(blob: Blob, mimeType: string) {
         button.disabled = true;
@@ -495,6 +636,7 @@ export function initMonaco() {
         button.classList.remove("recording");
         button.querySelector(".voice-icon-mic")?.removeAttribute("hidden");
         button.querySelector(".voice-icon-stop")?.setAttribute("hidden", "");
+        setVoiceVisualizerActive(false);
       }
 
       function stopRecording() {
@@ -506,6 +648,7 @@ export function initMonaco() {
       async function startRecording() {
         chunks = [];
         const mimeType = chooseRecordingMimeType();
+        primeVoiceAudioContext();
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
 
@@ -516,6 +659,7 @@ export function initMonaco() {
         recorder.addEventListener("stop", () => {
           stream?.getTracks().forEach((track) => track.stop());
           stream = null;
+          stopVoiceVisualizer();
           resetRecordingUi();
 
           const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
@@ -527,13 +671,14 @@ export function initMonaco() {
           void transcribe(blob, mimeType || "audio/webm");
         });
 
+        const visualizerStarted = await startVoiceVisualizer(stream);
         recorder.start();
         button.classList.add("recording");
         button.title = "Stop dictation";
         button.setAttribute("aria-label", "Stop dictation");
         button.querySelector(".voice-icon-mic")?.setAttribute("hidden", "");
         button.querySelector(".voice-icon-stop")?.removeAttribute("hidden");
-        setVoiceStatus("Recording");
+        setVoiceStatus(visualizerStarted ? "Recording" : "Recording (audio levels unavailable)");
       }
 
       button.addEventListener("click", () => {
@@ -546,6 +691,7 @@ export function initMonaco() {
           stream?.getTracks().forEach((track) => track.stop());
           stream = null;
           recorder = null;
+          stopVoiceVisualizer();
           resetRecordingUi();
           const message = err instanceof Error ? err.message : "Could not start dictation";
           setVoiceStatus(message);

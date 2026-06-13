@@ -366,6 +366,79 @@ html, body {
   animation: voicePulse 1s ease-in-out infinite;
 }
 
+.voice-visualizer {
+  --voice-level: 0;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: var(--voice-bottom-inset, 0px);
+  z-index: 1000;
+  height: 92px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 max(24px, calc((100% - 520px) / 2)) 16px;
+  color: color-mix(in srgb, var(--text-primary) 74%, transparent);
+  pointer-events: none;
+  opacity: 0;
+  overflow: hidden;
+  transform: translateY(0);
+  transition: opacity 0.18s ease;
+}
+
+.voice-visualizer.active {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.voice-visualizer::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 0;
+  background:
+    linear-gradient(to top, color-mix(in srgb, var(--bg-surface) 88%, transparent) 0%, color-mix(in srgb, var(--bg-surface) 58%, transparent) 58%, transparent 100%),
+    radial-gradient(ellipse at bottom, color-mix(in srgb, currentColor 7%, transparent), transparent 70%);
+}
+
+.voice-wave {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 54px;
+  display: grid;
+  grid-template-columns: repeat(17, minmax(3px, 1fr));
+  align-items: end;
+  gap: clamp(3px, 1.25vw, 12px);
+}
+
+.voice-wave-bar {
+  --level: 0.12;
+  display: block;
+  width: 100%;
+  min-width: 3px;
+  max-width: 9px;
+  height: calc(8px + (var(--level) * 42px));
+  justify-self: center;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: calc(0.26 + (var(--level) * 0.7));
+  transform-origin: 50% 100%;
+  transform: scaleY(calc(0.72 + (var(--voice-level) * 0.35)));
+  transition: height 70ms linear, opacity 110ms ease, transform 70ms linear;
+}
+
+.voice-wave-bar:nth-child(2n) {
+  margin-bottom: 5px;
+}
+
+.voice-wave-bar:nth-child(4n + 1) {
+  margin-bottom: 12px;
+}
+
+.voice-wave-bar:nth-child(3n) {
+  opacity: calc(0.2 + (var(--level) * 0.55));
+}
+
 @keyframes voicePulse {
   0%, 100% { opacity: 0.45; transform: scale(0.92); }
   50% { opacity: 1; transform: scale(1); }
@@ -376,6 +449,10 @@ html, body {
   min-height: 0;
   overflow: hidden;
   position: relative;
+}
+
+.pane-center .pane-content {
+  isolation: isolate;
 }
 
 /* URL Bar */
@@ -439,8 +516,11 @@ html, body {
 
 /* Editor */
 #editor-container {
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
+  overflow: hidden;
 }
 
 /* Dividers */
@@ -1153,6 +1233,21 @@ html, body {
   .voice-btn svg {
     width: 20px;
     height: 20px;
+  }
+
+  .voice-visualizer {
+    position: fixed;
+    left: 0;
+    right: 0;
+    height: 82px;
+    bottom: calc(72px + var(--voice-bottom-inset, 0px) + env(safe-area-inset-bottom));
+    z-index: 10000;
+    padding: 0 18px max(12px, env(safe-area-inset-bottom));
+  }
+
+  .voice-wave {
+    height: 48px;
+    gap: 4px;
   }
 
   .brand-name {
