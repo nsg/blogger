@@ -324,7 +324,7 @@ html, body {
 .editor-header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -339,9 +339,15 @@ html, body {
 }
 
 .voice-btn {
-  width: 28px;
-  height: 28px;
-  flex: 0 0 28px;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  margin-block: -6px;
+}
+
+.voice-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 .voice-btn.recording {
@@ -1123,6 +1129,30 @@ html, body {
 
   .topbar {
     padding: 0 10px;
+  }
+
+  .pane-header {
+    padding: 0 10px;
+  }
+
+  .editor-header-actions {
+    gap: 8px;
+  }
+
+  .voice-status {
+    max-width: 34vw;
+  }
+
+  .voice-btn {
+    width: 44px;
+    height: 44px;
+    flex-basis: 44px;
+    margin-block: -8px;
+  }
+
+  .voice-btn svg {
+    width: 20px;
+    height: 20px;
   }
 
   .brand-name {
