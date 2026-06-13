@@ -184,3 +184,76 @@ export async function requestSuggestion(paragraphId: string) {
   S.setProcessingParagraphId(null);
   if (S.onProcessingChanged) S.onProcessingChanged();
 }
+
+export async function requestVoiceCommand(paragraphId: string, prompt: string) {
+  const para = S.paragraphMap.get(paragraphId);
+  const command = prompt.trim();
+  if (!para || !command || !S.postSuggestion) return;
+  if (S.suggestionInFlight) return;
+
+  S.setSuggestionInFlight(true);
+  S.setProcessingParagraphId(paragraphId);
+  if (S.onProcessingChanged) S.onProcessingChanged();
+  if (S.showFeedbackIndicator) S.showFeedbackIndicator();
+
+  const messages = [
+    {
+      role: "system" as const,
+      content:
+        "You are a writing assistant embedded in a writing tool. The user selected one paragraph and spoke an instruction for how to change it. Follow the spoken instruction for the selected paragraph only unless the user explicitly asks for wider context. Be concise. When making a concrete paragraph change, use the edit_paragraph tool. The old_text is matched as an exact case-sensitive substring search in the editor, so it must appear verbatim in the selected paragraph text. The new_text replaces the first match. The user will see an 'Apply fix' button. Never use em dashes in your writing or suggestions.",
+    },
+    {
+      role: "user" as const,
+      content:
+        `[Full document]\n${S.getEditorValue()}\n[/Full document]\n\n` +
+        `[Selected paragraph]\n${para.currentText}\n[/Selected paragraph]\n\n` +
+        `Spoken instruction: ${command}`,
+    },
+  ];
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const toolLog = data?.tool_log as
+      | { tool: string; args: Record<string, unknown> }[]
+      | undefined;
+    if (toolLog && toolLog.length > 0 && S.postToolLog) {
+      S.postToolLog(toolLog);
+    }
+
+    const reply =
+      data?.message?.content || data?.choices?.[0]?.message?.content || "";
+    const toolCalls = data?.message?.tool_calls as
+      | { function: { name: string; arguments: { old_text: string; new_text: string } } }[]
+      | undefined;
+    const edits = (toolCalls || [])
+      .filter((tc) => tc.function?.name === "edit_paragraph")
+      .map((tc) => tc.function.arguments);
+
+    const previewWords = para.currentText.split(/\s+/).slice(0, 6).join(" ");
+    const ref =
+      `<span class="suggestion-ref">Voice: "${escapeHtml(command)}"</span>` +
+      `<span class="suggestion-ref">Re: "${escapeHtml(previewWords)}..."</span>`;
+    if (reply || edits.length > 0) {
+      S.postSuggestion(ref + (reply || "Suggested edit:"), edits.length > 0 ? edits : undefined);
+      S.nopParagraphs.delete(paragraphId);
+    }
+  } catch {
+    // silently ignore command errors
+  } finally {
+    if (S.hideFeedbackIndicator) S.hideFeedbackIndicator();
+    S.setSuggestionInFlight(false);
+    S.setProcessingParagraphId(null);
+    if (S.onProcessingChanged) S.onProcessingChanged();
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}

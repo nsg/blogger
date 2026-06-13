@@ -11,10 +11,14 @@ import {
   computeChangeRatio,
   canSuggest,
   requestSuggestion,
+  requestVoiceCommand,
 } from "./paragraphs.js";
 
 type AppTheme = "dark" | "light";
 type AudioContextWindow = Window & { webkitAudioContext?: typeof AudioContext };
+type VoiceRecordingMode =
+  | { kind: "dictation" }
+  | { kind: "paragraph-command"; paragraphId: string };
 
 function getDefaultContent(): string {
   return `# Welcome to Blogger
@@ -37,6 +41,10 @@ Happy writing.
 }
 
 const IMAGE_LINE_RE = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/;
+const FEEDBACK_ICON_SVG =
+  '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/></svg>';
+const MIC_ICON_SVG =
+  '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/></svg>';
 
 function parseImageLine(line: string): { alt: string; path: string } | null {
   const m = line.match(IMAGE_LINE_RE);
@@ -167,6 +175,10 @@ export function initMonaco() {
           getPosition: () => { lineNumber: number; column: number } | null;
           onDidChangeCursorPosition: (cb: (e: { position: { lineNumber: number; column: number } }) => void) => void;
           onMouseDown: (cb: (e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => void) => void;
+          onDidScrollChange: (cb: () => void) => void;
+          onDidLayoutChange: (cb: () => void) => void;
+          getScrollTop: () => number;
+          getTopForLineNumber: (lineNumber: number) => number;
           deltaDecorations: (oldDecorations: string[], newDecorations: IModelDeltaDecoration[]) => string[];
           executeEdits: (source: string, edits: { range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number }; text: string }[]) => void;
           focus: () => void;
@@ -383,12 +395,12 @@ export function initMonaco() {
         wordWrap: "on",
         minimap: { enabled: false },
         glyphMargin: true,
-        glyphMarginWidth: 16,
+        glyphMarginWidth: 48,
         folding: true,
         showFoldingControls: "always",
         lineNumbers: "on",
-        lineNumbersMinChars: 2,
-        lineDecorationsWidth: 0,
+        lineNumbersMinChars: 5,
+        lineDecorationsWidth: 24,
         renderLineHighlight: "all",
         scrollBeyondLastLine: false,
         padding: { top: 20, bottom: 112 },
@@ -409,6 +421,9 @@ export function initMonaco() {
     const voiceBtn = document.getElementById("voice-record") as HTMLButtonElement | null;
     const voiceStatus = document.getElementById("voice-status");
     const voiceVisualizer = document.getElementById("voice-visualizer") as HTMLElement | null;
+    const paragraphActionsLayer = document.createElement("div");
+    paragraphActionsLayer.className = "paragraph-actions-layer";
+    editorContainer.appendChild(paragraphActionsLayer);
     if (voiceVisualizer && voiceVisualizer.parentElement !== editorContainer) {
       editorContainer.appendChild(voiceVisualizer);
     }
@@ -469,6 +484,9 @@ export function initMonaco() {
       editor.focus();
     }
 
+    let voiceCommandParagraphId: string | null = null;
+    let startParagraphVoiceCommand: (paragraphId: string) => void = () => {};
+
     function initVoiceInput() {
       if (!voiceBtn) return;
       const button = voiceBtn;
@@ -482,6 +500,7 @@ export function initMonaco() {
       let recorder: MediaRecorder | null = null;
       let stream: MediaStream | null = null;
       let chunks: Blob[] = [];
+      let recordingMode: VoiceRecordingMode = { kind: "dictation" };
       let audioContext: AudioContext | null = null;
       let analyser: AnalyserNode | null = null;
       let sourceNode: MediaStreamAudioSourceNode | null = null;
@@ -605,11 +624,11 @@ export function initMonaco() {
         return true;
       }
 
-      async function transcribe(blob: Blob, mimeType: string) {
+      async function transcribe(blob: Blob, mimeType: string, mode: VoiceRecordingMode) {
         button.disabled = true;
         button.classList.remove("recording");
         button.classList.add("transcribing");
-        setVoiceStatus("Transcribing...");
+        setVoiceStatus(mode.kind === "paragraph-command" ? "Transcribing command..." : "Transcribing...");
 
         try {
           const form = new FormData();
@@ -619,7 +638,12 @@ export function initMonaco() {
           if (!res.ok) {
             throw new Error(data.error || "Transcription failed");
           }
-          insertTranscript(typeof data.text === "string" ? data.text : "");
+          const text = typeof data.text === "string" ? data.text : "";
+          if (mode.kind === "paragraph-command") {
+            await requestVoiceCommand(mode.paragraphId, text);
+          } else {
+            insertTranscript(text);
+          }
           setVoiceStatus("");
         } catch (err) {
           const message = err instanceof Error ? err.message : "Transcription failed";
@@ -627,6 +651,9 @@ export function initMonaco() {
         } finally {
           button.disabled = false;
           button.classList.remove("transcribing");
+          button.classList.remove("command-mode");
+          voiceCommandParagraphId = null;
+          updateGutterIcons();
           button.title = "Start dictation";
           button.setAttribute("aria-label", "Start dictation");
         }
@@ -634,8 +661,11 @@ export function initMonaco() {
 
       function resetRecordingUi() {
         button.classList.remove("recording");
+        button.classList.remove("command-mode");
         button.querySelector(".voice-icon-mic")?.removeAttribute("hidden");
         button.querySelector(".voice-icon-stop")?.setAttribute("hidden", "");
+        voiceCommandParagraphId = null;
+        updateGutterIcons();
         setVoiceVisualizerActive(false);
       }
 
@@ -668,18 +698,43 @@ export function initMonaco() {
             setVoiceStatus("");
             return;
           }
-          void transcribe(blob, mimeType || "audio/webm");
+          void transcribe(blob, mimeType || "audio/webm", recordingMode);
         });
 
         const visualizerStarted = await startVoiceVisualizer(stream);
         recorder.start();
         button.classList.add("recording");
-        button.title = "Stop dictation";
-        button.setAttribute("aria-label", "Stop dictation");
+        button.classList.toggle("command-mode", recordingMode.kind === "paragraph-command");
+        button.title = recordingMode.kind === "paragraph-command" ? "Stop voice command" : "Stop dictation";
+        button.setAttribute("aria-label", button.title);
         button.querySelector(".voice-icon-mic")?.setAttribute("hidden", "");
         button.querySelector(".voice-icon-stop")?.removeAttribute("hidden");
-        setVoiceStatus(visualizerStarted ? "Recording" : "Recording (audio levels unavailable)");
+        setVoiceStatus(
+          recordingMode.kind === "paragraph-command"
+            ? (visualizerStarted ? "Recording command" : "Recording command (audio levels unavailable)")
+            : (visualizerStarted ? "Recording" : "Recording (audio levels unavailable)")
+        );
       }
+
+      startParagraphVoiceCommand = (paragraphId: string) => {
+        if (recorder && recorder.state === "recording") {
+          stopRecording();
+          return;
+        }
+
+        voiceCommandParagraphId = paragraphId;
+        recordingMode = { kind: "paragraph-command", paragraphId };
+        updateGutterIcons();
+        startRecording().catch((err) => {
+          stream?.getTracks().forEach((track) => track.stop());
+          stream = null;
+          recorder = null;
+          stopVoiceVisualizer();
+          resetRecordingUi();
+          const message = err instanceof Error ? err.message : "Could not start voice command";
+          setVoiceStatus(message);
+        });
+      };
 
       button.addEventListener("click", () => {
         if (recorder && recorder.state === "recording") {
@@ -687,6 +742,9 @@ export function initMonaco() {
           return;
         }
 
+        voiceCommandParagraphId = null;
+        updateGutterIcons();
+        recordingMode = { kind: "dictation" };
         startRecording().catch((err) => {
           stream?.getTracks().forEach((track) => track.stop());
           stream = null;
@@ -780,26 +838,57 @@ export function initMonaco() {
     }
 
     let gutterDecorations: string[] = [];
-    function updateGutterIcons() {
-      const decorations: IModelDeltaDecoration[] = [];
+    function renderParagraphActions() {
+      paragraphActionsLayer.replaceChildren();
+      const scrollTop = editor.getScrollTop();
+      const lineHeight = 28;
+
       for (const [id, para] of S.paragraphMap) {
         if (para.startLine === para.endLine && parseImageLine(model.getLineContent(para.startLine))) continue;
-        const isProcessing = id === S.processingParagraphId;
-        const isNop = S.nopParagraphs.has(id);
-        let className = "paragraph-action-icon";
-        if (isProcessing) className += " paragraph-action-processing";
-        else if (isNop) className += " paragraph-action-nop";
-        let hoverMsg = "Get AI feedback on this paragraph";
-        if (isProcessing) hoverMsg = "Analyzing paragraph...";
-        else if (isNop) hoverMsg = "AI: paragraph looks good";
-        decorations.push({
-          range: new monaco.Range(para.startLine, 1, para.startLine, 1),
-          options: {
-            glyphMarginClassName: className,
-            glyphMarginHoverMessage: { value: hoverMsg },
-          },
+
+        const top = editor.getTopForLineNumber(para.startLine) - scrollTop + Math.max(0, (lineHeight - 28) / 2);
+        if (top < -28 || top > editorContainer.clientHeight) continue;
+
+        const group = document.createElement("div");
+        group.className = "paragraph-action-group";
+        group.style.top = `${top}px`;
+        group.dataset.paragraphId = id;
+
+        const feedbackBtn = document.createElement("button");
+        feedbackBtn.type = "button";
+        feedbackBtn.className = "paragraph-action-btn feedback";
+        feedbackBtn.title = S.nopParagraphs.has(id) ? "AI: paragraph looks good" : "Get AI feedback on this paragraph";
+        feedbackBtn.setAttribute("aria-label", feedbackBtn.title);
+        feedbackBtn.innerHTML = FEEDBACK_ICON_SVG;
+        if (S.nopParagraphs.has(id)) feedbackBtn.classList.add("nop");
+        if (S.processingParagraphId === id) feedbackBtn.classList.add("processing");
+        feedbackBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          requestSuggestion(id);
         });
+
+        const commandBtn = document.createElement("button");
+        commandBtn.type = "button";
+        commandBtn.className = "paragraph-action-btn command";
+        commandBtn.title = "Speak an instruction for this paragraph";
+        commandBtn.setAttribute("aria-label", commandBtn.title);
+        commandBtn.innerHTML = MIC_ICON_SVG;
+        if (voiceCommandParagraphId === id) commandBtn.classList.add("listening");
+        commandBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startParagraphVoiceCommand(id);
+        });
+
+        group.appendChild(feedbackBtn);
+        group.appendChild(commandBtn);
+        paragraphActionsLayer.appendChild(group);
       }
+    }
+
+    function updateGutterIcons() {
+      const decorations: IModelDeltaDecoration[] = [];
       const lineCount = model.getLineCount();
       for (let ln = 1; ln <= lineCount; ln++) {
         const line = model.getLineContent(ln);
@@ -814,11 +903,18 @@ export function initMonaco() {
         }
       }
       gutterDecorations = editor.deltaDecorations(gutterDecorations, decorations);
+      renderParagraphActions();
     }
     updateGutterIcons();
     S.setOnProcessingChanged(() => updateGutterIcons());
 
-    editor.onMouseDown((e: { target: { type: number; position: { lineNumber: number; column: number } | null } }) => {
+    editor.onMouseDown((e: {
+      target: {
+        type: number;
+        position: { lineNumber: number; column: number } | null;
+        element?: HTMLElement | null;
+      };
+    }) => {
       if (e.target.type === 2 && e.target.position) {
         const ln = e.target.position.lineNumber;
         const line = model.getLineContent(ln);
@@ -882,7 +978,12 @@ export function initMonaco() {
       S.setCurrentParagraphId(newParaId);
     });
 
-    window.addEventListener("resize", () => editor.layout());
+    editor.onDidScrollChange(() => renderParagraphActions());
+    editor.onDidLayoutChange(() => renderParagraphActions());
+    window.addEventListener("resize", () => {
+      editor.layout();
+      renderParagraphActions();
+    });
 
     let lastObservedWidth = 0;
     let lastObservedHeight = 0;
