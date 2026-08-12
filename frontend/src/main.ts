@@ -1,7 +1,9 @@
 import * as S from "./state.js";
 import { initMonaco } from "./editor.js";
 import { initAssistant } from "./assistant.js";
-import { initThemeToggle, initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPaneTabs, initUrlBar, initPreview } from "./ui.js";
+import { initThemeToggle, initPaneToggles, initDividerDrag, initResponsivePreviewPane, initWorkPaneTabs, initUrlBar, initPreview, initLogout } from "./ui.js";
+import { initArchive } from "./archive.js";
+import { initGitUi } from "./gitui.js";
 
 // Expose debug state for testing
 (window as unknown as Record<string, unknown>).__debug = {
@@ -14,7 +16,6 @@ import { initThemeToggle, initPaneToggles, initDividerDrag, initResponsivePrevie
 };
 
 initThemeToggle();
-initMonaco();
 initPaneToggles();
 initResponsivePreviewPane();
 initWorkPaneTabs();
@@ -23,3 +24,13 @@ initDividerDrag("divider-right", "pane-center", "pane-right");
 initUrlBar();
 initAssistant();
 initPreview();
+initLogout();
+
+async function startEditor() {
+  const documents = await initMonaco();
+  const git = initGitUi(documents);
+  initArchive(documents, git);
+  await documents.initializeSelection();
+}
+
+void startEditor();

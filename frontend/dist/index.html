@@ -42,9 +42,42 @@
         <button class="icon-btn" id="toggle-right" aria-label="Toggle panel" title="Toggle right pane">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
         </button>
+        <button class="icon-btn" id="logout" type="button" aria-label="Log out" title="Log out">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></svg>
+        </button>
       </div>
     </header>
     <div class="workspace">
+      <aside class="archive-panel" id="archive-panel" aria-label="Blog post archive">
+        <div class="archive-rail-header">
+          <button class="icon-btn archive-toggle" id="archive-toggle" type="button" aria-label="Open posts" title="Open posts" aria-expanded="false">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          </button>
+          <span class="archive-title">Posts</span>
+          <div class="archive-header-actions">
+            <button class="icon-btn compact" id="archive-refresh" type="button" aria-label="Refresh posts" title="Refresh posts">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg>
+            </button>
+            <button class="icon-btn compact" id="new-post" type="button" aria-label="New post" title="New post">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button class="icon-btn compact git-publish" id="git-publish" type="button" aria-label="Commit and push" title="Commit and push" disabled>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/></svg>
+              <span class="git-badge" id="git-badge" hidden></span>
+            </button>
+            <button class="icon-btn compact" id="git-sync" type="button" aria-label="Sync from GitHub" title="Sync from GitHub">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-5V2"/><path d="M20 2l-4 4a9 9 0 1 0 2.6 6.4"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="archive-content" id="archive-content" aria-live="polite">
+          <div class="archive-skeleton" id="archive-skeleton">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </div>
+      </aside>
+      <div class="archive-divider" id="archive-divider" aria-hidden="true"></div>
+      <div class="archive-backdrop" id="archive-backdrop"></div>
       <div class="pane pane-left" id="pane-left">
         <div class="pane-header">
           <span class="pane-label">Reference</span>
@@ -63,10 +96,15 @@
       <div class="divider" id="divider-left"></div>
       <div class="pane pane-center" id="pane-center">
         <div class="pane-header">
-          <span class="pane-label">Editor</span>
+          <div class="editor-title-wrap">
+            <span class="pane-label">Editor</span>
+            <span class="editor-post-title" id="editor-post-title"></span>
+          </div>
           <div class="editor-header-actions">
+            <span class="save-state saved" id="save-state" aria-live="polite">Saved</span>
+            <button class="save-retry" id="save-retry" type="button" hidden>Retry</button>
             <span class="voice-status" id="voice-status" aria-live="polite"></span>
-            <button class="icon-btn voice-btn" id="voice-record" type="button" aria-label="Start dictation" title="Start dictation">
+            <button class="icon-btn voice-btn" id="voice-record" type="button" aria-label="Start dictation" title="Start dictation" disabled>
               <svg class="voice-icon-mic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/></svg>
               <svg class="voice-icon-stop" hidden width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>
             </button>
@@ -74,7 +112,20 @@
           </div>
         </div>
         <div class="pane-content">
+          <div class="editor-banner" id="editor-banner" hidden role="alert">
+            <div>
+              <strong id="editor-banner-title"></strong>
+              <span id="editor-banner-message"></span>
+            </div>
+            <div class="editor-banner-actions" id="editor-banner-actions"></div>
+          </div>
           <div id="editor-container"></div>
+          <div class="editor-empty" id="editor-empty">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
+            <h2>Select a post to start writing</h2>
+            <p>Your posts are organized by date in the archive.</p>
+            <button type="button" id="empty-open-archive">Browse posts</button>
+          </div>
           <div class="voice-visualizer" id="voice-visualizer" aria-hidden="true">
             <div class="voice-wave">
               <span class="voice-wave-bar"></span>
@@ -109,7 +160,7 @@
           <div class="assistant-input-area">
             <div class="assistant-context-toggle">
               <label class="context-check">
-                <input type="checkbox" id="include-context" checked>
+                <input type="checkbox" id="include-context" checked disabled>
                 <span class="checkmark"></span>
                 Include editor content
               </label>

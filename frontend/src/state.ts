@@ -1,4 +1,4 @@
-import { TrackedParagraph } from "./types.js";
+import type { TrackedParagraph } from "./types.js";
 
 export const paragraphMap: Map<string, TrackedParagraph> = new Map();
 export let currentParagraphId: string | null = null;

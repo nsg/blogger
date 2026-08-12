@@ -3,8 +3,11 @@ declare const require: {
   (deps: string[], callback: (...args: unknown[]) => void): void;
 };
 
-import { IModelDeltaDecoration } from "./types.js";
+import { ApiError } from "./api.js";
+import { api, jsonRequest, mutationEvent } from "./api.js";
+import type { IModelDeltaDecoration, PostDocumentController, PostResponse, RecoverPostResponse, SaveResponse } from "./types.js";
 import * as S from "./state.js";
+import { field, modalButton, openModal, showModalError } from "./modal.js";
 import {
   reconcileParagraphs,
   getParagraphAtLine,
@@ -19,26 +22,6 @@ type AudioContextWindow = Window & { webkitAudioContext?: typeof AudioContext };
 type VoiceRecordingMode =
   | { kind: "dictation" }
   | { kind: "paragraph-command"; paragraphId: string };
-
-function getDefaultContent(): string {
-  return `# Welcome to Blogger
-
-Start writing here. This editor supports **Markdown** with full syntax highlighting.
-
-## Features
-
-- Rich markdown editing powered by Monaco
-- Reference pane on the left for browsing sources
-- Resizable panels — drag the dividers
-
----
-
-> "The first draft is just you telling yourself the story."
-> — Terry Pratchett
-
-Happy writing.
-`;
-}
 
 const IMAGE_LINE_RE = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/;
 const FEEDBACK_ICON_SVG =
@@ -105,9 +88,15 @@ function showImageEditDialog(
   });
 
   function close() {
+    document.removeEventListener("keydown", onDialogKeydown);
     overlay.classList.remove("visible");
     setTimeout(() => overlay.remove(), 150);
   }
+
+  function onDialogKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") close();
+  }
+  document.addEventListener("keydown", onDialogKeydown);
 
   renameBtn.addEventListener("click", () => {
     const val = input.value.trim();
@@ -150,7 +139,8 @@ function getActiveTheme(): AppTheme {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
 
-export function initMonaco() {
+export function initMonaco(): Promise<PostDocumentController> {
+  return new Promise((resolve) => {
   require.config({
     paths: {
       vs: "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs",
@@ -158,7 +148,12 @@ export function initMonaco() {
   });
 
   require(["vs/editor/editor.main"], async () => {
-    const monaco = ((window as unknown) as Record<string, unknown>).monaco as {
+    const monaco = ((window as unknown) as Record<string, unknown>).monaco as any;
+    /* Monaco is loaded at runtime from its AMD distribution, so the small API
+       surface below is intentionally runtime-typed instead of depending on the
+       editor package at compile time. */
+    /*
+    const monacoTyped = monaco as {
       editor: {
         create: (
           el: HTMLElement,
@@ -193,6 +188,7 @@ export function initMonaco() {
       };
       Range: new (startLine: number, startCol: number, endLine: number, endCol: number) => { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
     };
+    */
 
     monaco.editor.defineTheme("nexus", {
       base: "vs-dark",
@@ -327,67 +323,11 @@ export function initMonaco() {
       },
     });
 
-    let initialContent = getDefaultContent();
-    let hasFile = false;
-    let canSync = false;
-    let documentRevision = 0;
-    try {
-      const res = await fetch("/api/initial-content");
-      if (res.ok) {
-        const data = await res.json();
-        if (data.path !== null && typeof data.content === "string") {
-          initialContent = data.content;
-          hasFile = true;
-        }
-        if (typeof data.revision === "number") {
-          documentRevision = data.revision;
-          canSync = true;
-        }
-      }
-    } catch {
-      // use default content
-    }
-
-    let saveTimer: ReturnType<typeof setTimeout> | null = null;
-    let saving = false;
-    let localDirty = false;
-    let applyingRemoteContent = false;
-    let lastSavedContent = initialContent;
-
-    async function autoSave(content: string) {
-      if (saving) return;
-      saving = true;
-      try {
-        const res = await fetch("/api/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content, revision: documentRevision }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (typeof data.revision === "number") {
-            documentRevision = data.revision;
-          }
-          lastSavedContent = content;
-          localDirty = model.getValue() !== content;
-        }
-      } catch {
-        // silently ignore save errors
-      }
-      saving = false;
-
-      if (canSync && localDirty && model.getValue() !== lastSavedContent) {
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => autoSave(model.getValue()), 1_000);
-      }
-    }
-
     const editorContainer = document.getElementById("editor-container")!;
     const editor = monaco.editor.create(
       editorContainer,
       {
-        value: initialContent,
-        language: "markdown",
+        model: null,
         theme: getActiveTheme() === "light" ? "nexus-light" : "nexus",
         fontFamily: "'Plus Jakarta Sans', sans-serif",
         fontSize: 15,
@@ -416,9 +356,25 @@ export function initMonaco() {
       }
     );
 
-    const model = editor.getModel();
+    let activeModel: any = null;
+    const model = new Proxy({}, {
+      get(_target, property) {
+        const value = activeModel?.[property];
+        return typeof value === "function" ? value.bind(activeModel) : value;
+      },
+    }) as any;
     const wordCountEl = document.getElementById("word-count")!;
+    const emptyState = document.getElementById("editor-empty")!;
+    const postTitleEl = document.getElementById("editor-post-title")!;
+    const saveStateEl = document.getElementById("save-state")!;
+    const saveRetry = document.getElementById("save-retry") as HTMLButtonElement;
+    const banner = document.getElementById("editor-banner")!;
+    const bannerTitle = document.getElementById("editor-banner-title")!;
+    const bannerMessage = document.getElementById("editor-banner-message")!;
+    const bannerActions = document.getElementById("editor-banner-actions")!;
+    const includeContext = document.getElementById("include-context") as HTMLInputElement;
     const voiceBtn = document.getElementById("voice-record") as HTMLButtonElement | null;
+    let voiceSupported = true;
     const voiceStatus = document.getElementById("voice-status");
     const voiceVisualizer = document.getElementById("voice-visualizer") as HTMLElement | null;
     const paragraphActionsLayer = document.createElement("div");
@@ -466,22 +422,28 @@ export function initMonaco() {
       return "webm";
     }
 
-    function insertTranscript(text: string) {
+    function applyModelEdit(targetModel: any, source: string, range: any, text: string) {
+      if (!targetModel || targetModel.isDisposed?.()) return;
+      if (targetModel === activeModel) {
+        editor.executeEdits(source, [{ range, text }]);
+      } else {
+        targetModel.pushEditOperations([], [{ range, text }], () => null);
+      }
+    }
+
+    function insertTranscript(text: string, targetModel: any, pos: { lineNumber: number; column: number } | null) {
       const trimmed = text.trim();
-      if (!trimmed) return;
+      if (!trimmed || !targetModel || !pos) return;
 
-      const pos = editor.getPosition();
-      if (!pos) return;
-
-      const line = model.getLineContent(pos.lineNumber);
+      const line = targetModel.getLineContent(pos.lineNumber);
       const before = line.slice(0, Math.max(0, pos.column - 1));
       const after = line.slice(Math.max(0, pos.column - 1));
       const prefix = before && !/\s$/.test(before) && !/^[.,!?;:)]/.test(trimmed) ? " " : "";
       const suffix = after && !/^\s/.test(after) && !/[([{]$/.test(trimmed) ? " " : "";
       const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
 
-      editor.executeEdits("voice-dictation", [{ range, text: `${prefix}${trimmed}${suffix}` }]);
-      editor.focus();
+      applyModelEdit(targetModel, "voice-dictation", range, `${prefix}${trimmed}${suffix}`);
+      if (targetModel === activeModel) editor.focus();
     }
 
     let voiceCommandParagraphId: string | null = null;
@@ -491,6 +453,7 @@ export function initMonaco() {
       if (!voiceBtn) return;
       const button = voiceBtn;
       if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        voiceSupported = false;
         button.disabled = true;
         button.title = "Dictation is not supported in this browser";
         button.setAttribute("aria-label", "Dictation is not supported in this browser");
@@ -506,6 +469,8 @@ export function initMonaco() {
       let sourceNode: MediaStreamAudioSourceNode | null = null;
       let voiceFrame: number | null = null;
       let timeData: Uint8Array<ArrayBuffer> | null = null;
+      let dictationTarget: { document: OpenDocument | null; position: { lineNumber: number; column: number } | null } | null = null;
+      let commandDocument: OpenDocument | null = null;
       const voiceBars = voiceVisualizer
         ? Array.from(voiceVisualizer.querySelectorAll<HTMLElement>(".voice-wave-bar"))
         : [];
@@ -634,25 +599,30 @@ export function initMonaco() {
           const form = new FormData();
           form.append("audio", blob, `dictation.${recordingExtension(mimeType)}`);
           const res = await fetch("/api/transcribe", { method: "POST", body: form });
+          if (res.status === 401) {
+            location.reload();
+            return;
+          }
           const data = await res.json().catch(() => ({}));
           if (!res.ok) {
             throw new Error(data.error || "Transcription failed");
           }
           const text = typeof data.text === "string" ? data.text : "";
           if (mode.kind === "paragraph-command") {
-            await requestVoiceCommand(mode.paragraphId, text);
+            if (commandDocument === activeDocument) await requestVoiceCommand(mode.paragraphId, text);
           } else {
-            insertTranscript(text);
+            insertTranscript(text, dictationTarget?.document?.model, dictationTarget?.position ?? null);
           }
           setVoiceStatus("");
         } catch (err) {
           const message = err instanceof Error ? err.message : "Transcription failed";
           setVoiceStatus(message);
         } finally {
-          button.disabled = false;
+          button.disabled = !activeDocument || !voiceSupported;
           button.classList.remove("transcribing");
           button.classList.remove("command-mode");
           voiceCommandParagraphId = null;
+          commandDocument = null;
           updateGutterIcons();
           button.title = "Start dictation";
           button.setAttribute("aria-label", "Start dictation");
@@ -677,6 +647,9 @@ export function initMonaco() {
 
       async function startRecording() {
         chunks = [];
+        dictationTarget = recordingMode.kind === "dictation"
+          ? { document: activeDocument, position: editor.getPosition() }
+          : null;
         const mimeType = chooseRecordingMimeType();
         primeVoiceAudioContext();
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -723,6 +696,7 @@ export function initMonaco() {
         }
 
         voiceCommandParagraphId = paragraphId;
+        commandDocument = activeDocument;
         recordingMode = { kind: "paragraph-command", paragraphId };
         updateGutterIcons();
         startRecording().catch((err) => {
@@ -743,6 +717,7 @@ export function initMonaco() {
         }
 
         voiceCommandParagraphId = null;
+        commandDocument = null;
         updateGutterIcons();
         recordingMode = { kind: "dictation" };
         startRecording().catch((err) => {
@@ -766,17 +741,127 @@ export function initMonaco() {
       wordCountEl.textContent = `${words} word${words !== 1 ? "s" : ""}`;
     }
 
-    model.onDidChangeContent(() => {
-      updateWordCount();
+    interface OpenDocument {
+      path: string;
+      model: any;
+      revision: string;
+      url: string;
+      title: string;
+      lastSaved: string;
+      dirty: boolean;
+      saving: boolean;
+      applying: boolean;
+      deleted: boolean;
+      conflict: boolean;
+      blocked: boolean;
+      failed: boolean;
+      saveTimer: ReturnType<typeof setTimeout> | null;
+      retryTimer: ReturnType<typeof setTimeout> | null;
+      retryDelay: number;
+      savePromise: Promise<boolean> | null;
+      viewState: unknown;
+      decorations: string[];
+    }
 
-      if (canSync && !applyingRemoteContent) {
-        localDirty = true;
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => autoSave(model.getValue()), 5_000);
+    const documents = new Map<string, OpenDocument>();
+    let activeDocument: OpenDocument | null = null;
+    let archiveOpener: () => void = () => {};
+
+    function setSaveState(state: "unsaved" | "saving" | "saved" | "failed") {
+      const labels = {
+        unsaved: "Unsaved changes",
+        saving: "Saving…",
+        saved: "Saved",
+        failed: "Save failed — retrying",
+      };
+      saveStateEl.textContent = labels[state];
+      saveStateEl.className = `save-state ${state}`;
+      saveRetry.hidden = state !== "failed";
+    }
+
+    function clearBanner() {
+      banner.hidden = true;
+      bannerTitle.textContent = "";
+      bannerMessage.textContent = "";
+      bannerActions.replaceChildren();
+    }
+
+    function bannerButton(label: string, run: () => void) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", run);
+      bannerActions.appendChild(button);
+    }
+
+    function showConflict(doc: OpenDocument, message = "Your unsaved text is preserved. Choose which version to keep.") {
+      doc.conflict = true;
+      banner.hidden = false;
+      banner.className = "editor-banner conflict";
+      bannerTitle.textContent = "This post changed on disk";
+      bannerMessage.textContent = message;
+      bannerActions.replaceChildren();
+      bannerButton("Reload from disk", () => void reloadFromDisk(doc));
+      bannerButton("Overwrite", () => {
+        doc.conflict = false;
+        clearBanner();
+        void saveDocument(doc, "overwrite");
+      });
+    }
+
+    function oldSlug(path: string) {
+      return (path.split("/").pop() || "post").replace(/\.md$/, "");
+    }
+
+    function showDeleted(doc: OpenDocument) {
+      doc.deleted = true;
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      if (doc !== activeDocument) return;
+      banner.hidden = false;
+      banner.className = "editor-banner deleted";
+      bannerTitle.textContent = "File deleted on disk";
+      bannerMessage.textContent = "Your unsaved text is still here. Discard it or recover it as a new post.";
+      bannerActions.replaceChildren();
+      bannerButton("Discard and close", () => {
+        documents.delete(doc.path);
+        if (doc === activeDocument) clearSelection(true);
+        doc.model.dispose();
+      });
+      bannerButton("Save as new post", () => openRecoveryDialog(doc));
+      setSaveState("unsaved");
+    }
+
+    function showCollision(doc: OpenDocument, error: ApiError) {
+      doc.blocked = true;
+      banner.hidden = false;
+      banner.className = "editor-banner collision";
+      bannerTitle.textContent = error.body.error;
+      bannerMessage.textContent = [error.body.conflicting_url, error.body.conflicting_path].filter(Boolean).join(" · ");
+      bannerActions.replaceChildren();
+      setSaveState("unsaved");
+    }
+
+    function handleModelChange(doc: OpenDocument) {
+      if (doc === activeDocument) updateWordCount();
+      if (!doc.applying) {
+        doc.dirty = doc.model.getValue() !== doc.lastSaved;
+        if (doc.blocked) doc.blocked = false;
+        if (doc === activeDocument) {
+          if (doc.deleted) showDeleted(doc);
+          else if (doc.conflict) showConflict(doc);
+          else clearBanner();
+          setSaveState(doc.failed ? "failed" : doc.dirty ? "unsaved" : "saved");
+        }
+        if (doc.saveTimer) clearTimeout(doc.saveTimer);
+        if (doc.dirty && !doc.deleted && !doc.conflict) {
+          doc.saveTimer = setTimeout(() => void saveDocument(doc), 5_000);
+        }
       }
 
       if (S.reconcileTimer) clearTimeout(S.reconcileTimer);
       S.setReconcileTimer(setTimeout(() => {
+        if (doc !== activeDocument) return;
         reconcileParagraphs(model);
         updateGutterIcons();
 
@@ -797,49 +882,310 @@ export function initMonaco() {
           }
         }
       }, 300));
-    });
-    updateWordCount();
-    initVoiceInput();
+    }
 
-    async function pollDocumentState() {
-      if (!canSync || localDirty || saving) return;
+    function scheduleRetry(doc: OpenDocument) {
+      if (doc.retryTimer || doc.deleted || doc.conflict || doc.blocked) return;
+      doc.retryTimer = setTimeout(() => {
+        doc.retryTimer = null;
+        void saveDocument(doc);
+      }, doc.retryDelay);
+      doc.retryDelay = Math.min(doc.retryDelay * 2, 15_000);
+    }
 
-      try {
-        const res = await fetch("/api/document-state");
-        if (!res.ok) return;
-        const data = await res.json();
-        if (typeof data.revision !== "number" || data.revision <= documentRevision) return;
-        if (typeof data.content !== "string" || data.content === model.getValue()) {
-          documentRevision = data.revision;
-          return;
+    async function saveDocument(doc: OpenDocument, revision = doc.revision): Promise<boolean> {
+      if (doc.deleted || doc.conflict || doc.blocked || !doc.dirty) return !doc.dirty;
+      if (doc.saving && doc.savePromise) return doc.savePromise;
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+      doc.saving = true;
+      if (doc === activeDocument) setSaveState("saving");
+      const content = doc.model.getValue();
+      const pending = (async () => {
+        try {
+          const result = await api<SaveResponse>("/api/post/save", jsonRequest("POST", {
+            path: doc.path,
+            content,
+            base_revision: revision,
+          }));
+          doc.revision = result.revision;
+          doc.url = result.url;
+          doc.lastSaved = content;
+          doc.dirty = doc.model.getValue() !== content;
+          doc.retryDelay = 1500;
+          doc.failed = false;
+          if (doc.retryTimer) clearTimeout(doc.retryTimer);
+          doc.retryTimer = null;
+          if (doc === activeDocument) {
+            setSaveState(doc.dirty ? "unsaved" : "saved");
+            window.dispatchEvent(new CustomEvent("blogger-post-selected", { detail: { path: doc.path, url: doc.url } }));
+          }
+          mutationEvent({ kind: "post-save" });
+          if (doc.dirty) doc.saveTimer = setTimeout(() => void saveDocument(doc), 1_000);
+          return true;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            if (error.body.deleted) showDeleted(doc);
+            else if (doc === activeDocument) showConflict(doc);
+            return false;
+          }
+          if (error instanceof ApiError && error.status === 422) {
+            if (doc === activeDocument) showCollision(doc, error);
+            return false;
+          }
+          if (doc === activeDocument) setSaveState("failed");
+          doc.failed = true;
+          scheduleRetry(doc);
+          return false;
+        } finally {
+          doc.saving = false;
+          doc.savePromise = null;
         }
+      })();
+      doc.savePromise = pending;
+      return pending;
+    }
 
-        applyingRemoteContent = true;
-        model.setValue(data.content);
-        applyingRemoteContent = false;
-        documentRevision = data.revision;
-        lastSavedContent = data.content;
-        localDirty = false;
-      } catch {
-        // keep the local editor usable if polling fails
-      } finally {
-        applyingRemoteContent = false;
+    async function flushDocument(doc: OpenDocument): Promise<boolean> {
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+      while (doc.saving && doc.savePromise) await doc.savePromise;
+      while (doc.dirty && !doc.deleted && !doc.conflict && !doc.blocked) {
+        if (!(await saveDocument(doc))) return false;
+      }
+      return !doc.dirty;
+    }
+
+    async function reloadFromDisk(doc: OpenDocument) {
+      try {
+        const loaded = await api<PostResponse>(`/api/post?path=${encodeURIComponent(doc.path)}`);
+        doc.applying = true;
+        const view = doc === activeDocument ? editor.saveViewState() : doc.viewState;
+        doc.model.setValue(loaded.content);
+        doc.applying = false;
+        doc.revision = loaded.revision;
+        doc.url = loaded.url;
+        doc.title = loaded.title;
+        doc.lastSaved = loaded.content;
+        doc.dirty = false;
+        doc.conflict = false;
+        doc.deleted = false;
+        doc.failed = false;
+        if (doc.retryTimer) clearTimeout(doc.retryTimer);
+        doc.retryTimer = null;
+        doc.decorations = [];
+        clearBanner();
+        if (doc === activeDocument) {
+          if (view) editor.restoreViewState(view);
+          setSaveState("saved");
+          postTitleEl.textContent = doc.title;
+          updateWordCount();
+          reconcileParagraphs(model);
+          updateGutterIcons();
+          window.dispatchEvent(new CustomEvent("blogger-post-selected", { detail: { path: doc.path, url: doc.url } }));
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) showDeleted(doc);
       }
     }
 
-    setInterval(pollDocumentState, 2_000);
-
-    reconcileParagraphs(model);
-    const initPos = editor.getPosition();
-    if (initPos) {
-      S.setCurrentParagraphId(getParagraphAtLine(initPos.lineNumber));
-      const initPara = S.currentParagraphId ? S.paragraphMap.get(S.currentParagraphId) : null;
-      S.setAnchorText(initPara ? initPara.currentText : null);
+    function openRecoveryDialog(doc: OpenDocument) {
+      const modal = openModal("Save as new post");
+      const slug = document.createElement("input");
+      slug.type = "text";
+      slug.value = `${oldSlug(doc.path)}-recovered`;
+      modal.body.append(field("New slug", slug));
+      const cancel = modalButton("Cancel");
+      const save = modalButton("Recover post", "confirm");
+      cancel.addEventListener("click", modal.close);
+      save.addEventListener("click", async () => {
+        save.disabled = true;
+        try {
+          const recovered = await api<RecoverPostResponse>("/api/post/recover", jsonRequest("POST", {
+            content: doc.model.getValue(), slug: slug.value.trim(),
+          }));
+          const content = doc.model.getValue();
+          documents.delete(doc.path);
+          if (doc === activeDocument) {
+            activeDocument = null;
+            activeModel = null;
+            editor.setModel(null);
+          }
+          doc.model.dispose();
+          modal.close();
+          const loaded: PostResponse = {
+            ...recovered,
+            content,
+            title: doc.title,
+          };
+          await openPost(recovered.path, loaded, true);
+          mutationEvent({ kind: "post-recover" });
+        } catch (error) {
+          showModalError(modal, error instanceof Error ? error.message : "Recovery failed");
+          save.disabled = false;
+        }
+      });
+      modal.actions.append(cancel, save);
+      requestAnimationFrame(() => slug.focus());
     }
+
+    async function confirmDiscard(): Promise<boolean> {
+      return new Promise((done) => {
+        const modal = openModal("Unsaved changes");
+        let settled = false;
+        const message = document.createElement("p");
+        message.textContent = "This post cannot be saved right now. Stay here, or discard the unsaved changes and switch posts.";
+        modal.body.appendChild(message);
+        const stay = modalButton("Stay");
+        const discard = modalButton("Discard and switch", "delete");
+        const finish = (choice: boolean) => {
+          if (settled) return;
+          settled = true;
+          modal.close();
+          done(choice);
+        };
+        const observer = new MutationObserver(() => {
+          if (!modal.overlay.isConnected) {
+            observer.disconnect();
+            finish(false);
+          }
+        });
+        observer.observe(document.body, { childList: true });
+        stay.addEventListener("click", () => finish(false));
+        discard.addEventListener("click", () => finish(true));
+        modal.actions.append(discard, stay);
+      });
+    }
+
+    async function openPost(path: string, supplied?: PostResponse, force = false): Promise<boolean> {
+      if (activeDocument?.path === path) return true;
+      if (activeDocument?.dirty && !force) {
+        const saved = await flushDocument(activeDocument);
+        if (!saved && !(await confirmDiscard())) return false;
+        if (activeDocument.dirty) {
+          activeDocument.applying = true;
+          activeDocument.model.setValue(activeDocument.lastSaved);
+          activeDocument.applying = false;
+          activeDocument.dirty = false;
+          activeDocument.conflict = false;
+          activeDocument.deleted = false;
+          activeDocument.blocked = false;
+          activeDocument.failed = false;
+          if (activeDocument.retryTimer) clearTimeout(activeDocument.retryTimer);
+          activeDocument.retryTimer = null;
+        }
+      }
+      let doc = documents.get(path);
+      try {
+        const loaded = supplied ?? await api<PostResponse>(`/api/post?path=${encodeURIComponent(path)}`);
+        if (!doc) {
+          const postModel = monaco.editor.createModel(loaded.content, "markdown", monaco.Uri.parse(`inmemory://post/${loaded.path}`));
+          doc = {
+            path: loaded.path, model: postModel, revision: loaded.revision, url: loaded.url,
+            title: loaded.title, lastSaved: loaded.content, dirty: false, saving: false,
+            applying: false, deleted: false, conflict: false, blocked: false,
+            failed: false,
+            saveTimer: null, retryTimer: null, retryDelay: 1500, savePromise: null, viewState: null,
+            decorations: [],
+          };
+          documents.set(path, doc);
+          postModel.onDidChangeContent(() => handleModelChange(doc!));
+        } else if (!doc.dirty && doc.revision !== loaded.revision) {
+          doc.applying = true;
+          doc.model.setValue(loaded.content);
+          doc.applying = false;
+          doc.revision = loaded.revision;
+          doc.lastSaved = loaded.content;
+          doc.url = loaded.url;
+          doc.title = loaded.title;
+          doc.conflict = false;
+          doc.deleted = false;
+          doc.blocked = false;
+        }
+        if (doc && !doc.dirty) {
+          doc.conflict = false;
+          doc.deleted = false;
+          doc.blocked = false;
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          if (localStorage.getItem("blogger-selected-post") === path) localStorage.removeItem("blogger-selected-post");
+          clearSelection(true);
+          return false;
+        }
+        throw error;
+      }
+      if (activeDocument) activeDocument.viewState = editor.saveViewState();
+      activeDocument = doc!;
+      activeModel = doc!.model;
+      editor.setModel(activeModel);
+      gutterDecorations = doc!.decorations;
+      if (doc!.viewState) editor.restoreViewState(doc!.viewState);
+      emptyState.hidden = true;
+      editorContainer.classList.remove("empty");
+      includeContext.disabled = false;
+      if (voiceBtn) voiceBtn.disabled = !voiceSupported;
+      postTitleEl.textContent = doc!.title;
+      localStorage.setItem("blogger-selected-post", doc!.path);
+      setSaveState(doc!.failed ? "failed" : doc!.dirty ? "unsaved" : "saved");
+      clearBanner();
+      S.paragraphMap.clear();
+      S.nopParagraphs.clear();
+      S.setCurrentParagraphId(null);
+      S.setAnchorText(null);
+      reconcileParagraphs(model);
+      updateWordCount();
+      updateGutterIcons();
+      editor.layout();
+      editor.focus();
+      window.dispatchEvent(new CustomEvent("blogger-post-selected", { detail: { path: doc!.path, url: doc!.url } }));
+      return true;
+    }
+
+    function clearSelection(openArchive = false) {
+      if (activeDocument) activeDocument.viewState = editor.saveViewState();
+      activeDocument = null;
+      activeModel = null;
+      editor.setModel(null);
+      localStorage.removeItem("blogger-selected-post");
+      editorContainer.classList.add("empty");
+      emptyState.hidden = false;
+      postTitleEl.textContent = "";
+      wordCountEl.textContent = "0 words";
+      includeContext.disabled = true;
+      if (voiceBtn) voiceBtn.disabled = true;
+      saveStateEl.textContent = "";
+      saveRetry.hidden = true;
+      clearBanner();
+      S.paragraphMap.clear();
+      paragraphActionsLayer.replaceChildren();
+      window.dispatchEvent(new CustomEvent("blogger-post-selected", { detail: { path: null, url: null } }));
+      if (openArchive) archiveOpener();
+    }
+
+    async function checkActiveRevision() {
+      const doc = activeDocument;
+      if (!doc || doc.deleted || doc.saving) return;
+      try {
+        const loaded = await api<PostResponse>(`/api/post?path=${encodeURIComponent(doc.path)}`);
+        if (loaded.revision === doc.revision) return;
+        if (doc.dirty) showConflict(doc, "The disk version changed while you were editing. Your text has not been replaced.");
+        else await reloadFromDisk(doc);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          if (doc.dirty) showDeleted(doc);
+          else clearSelection(true);
+        }
+      }
+    }
+
+    initVoiceInput();
+    setInterval(() => void checkActiveRevision(), 3_000);
 
     let gutterDecorations: string[] = [];
     function renderParagraphActions() {
       paragraphActionsLayer.replaceChildren();
+      if (!activeModel) return;
       const scrollTop = editor.getScrollTop();
       const lineHeight = 28;
 
@@ -888,6 +1234,11 @@ export function initMonaco() {
     }
 
     function updateGutterIcons() {
+      if (!activeModel) {
+        gutterDecorations = editor.deltaDecorations(gutterDecorations, []);
+        renderParagraphActions();
+        return;
+      }
       const decorations: IModelDeltaDecoration[] = [];
       const lineCount = model.getLineCount();
       for (let ln = 1; ln <= lineCount; ln++) {
@@ -903,9 +1254,9 @@ export function initMonaco() {
         }
       }
       gutterDecorations = editor.deltaDecorations(gutterDecorations, decorations);
+      if (activeDocument) activeDocument.decorations = gutterDecorations;
       renderParagraphActions();
     }
-    updateGutterIcons();
     S.setOnProcessingChanged(() => updateGutterIcons());
 
     editor.onMouseDown((e: {
@@ -915,9 +1266,11 @@ export function initMonaco() {
         element?: HTMLElement | null;
       };
     }) => {
+      if (!activeModel) return;
       if (e.target.type === 2 && e.target.position) {
         const ln = e.target.position.lineNumber;
         const line = model.getLineContent(ln);
+        const operationDocument = activeDocument;
         const img = parseImageLine(line);
         if (img) {
           showImageEditDialog(
@@ -928,11 +1281,15 @@ export function initMonaco() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ old_path: img.path, new_name: newName }),
               })
-                .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+                .then((r) => {
+                  if (r.status === 401) location.reload();
+                  return r.ok ? r.json() : Promise.reject(r.statusText);
+                })
                 .then((data: { path: string }) => {
+                  mutationEvent({ kind: "image-rename" });
                   const newLine = `![${img.alt}](${data.path})`;
                   const range = new monaco.Range(ln, 1, ln, line.length + 1);
-                  editor.executeEdits("rename-image", [{ range, text: newLine }]);
+                  applyModelEdit(operationDocument?.model, "rename-image", range, newLine);
                 })
                 .catch(() => {});
             },
@@ -942,11 +1299,16 @@ export function initMonaco() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ path: img.path }),
               })
-                .then(() => {
-                  const startLn = ln > 1 && model.getLineContent(ln - 1).trim() === "" ? ln - 1 : ln;
-                  const endLn = ln < model.getLineCount() && model.getLineContent(ln + 1).trim() === "" ? ln + 1 : ln;
-                  const range = new monaco.Range(startLn, 1, endLn, model.getLineContent(endLn).length + 1);
-                  editor.executeEdits("delete-image", [{ range, text: "" }]);
+                .then((response) => {
+                  if (response.status === 401) location.reload();
+                  if (!response.ok) throw new Error(response.statusText);
+                  mutationEvent({ kind: "image-delete" });
+                  const operationModel = operationDocument?.model;
+                  if (!operationModel || operationModel.isDisposed?.()) return;
+                  const startLn = ln > 1 && operationModel.getLineContent(ln - 1).trim() === "" ? ln - 1 : ln;
+                  const endLn = ln < operationModel.getLineCount() && operationModel.getLineContent(ln + 1).trim() === "" ? ln + 1 : ln;
+                  const range = new monaco.Range(startLn, 1, endLn, operationModel.getLineContent(endLn).length + 1);
+                  applyModelEdit(operationModel, "delete-image", range, "");
                 })
                 .catch(() => {});
             },
@@ -1023,40 +1385,136 @@ export function initMonaco() {
 
       const pos = editor.getPosition();
       if (!pos) return;
+      const uploadDocument = activeDocument;
+      const uploadModel = uploadDocument?.model;
 
       const ext = file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
       const defaultName = file.name && file.name !== "image.png" ? file.name : `paste.${ext}`;
 
       const placeholder = "![uploading...]()";
       const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
-      editor.executeEdits("paste-image", [{ range, text: placeholder }]);
+      applyModelEdit(uploadModel, "paste-image", range, placeholder);
 
       const form = new FormData();
       form.append("image", file, defaultName);
 
       fetch("/api/upload-image", { method: "POST", body: form })
-        .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+        .then((res) => {
+          if (res.status === 401) location.reload();
+          return res.ok ? res.json() : Promise.reject(res.statusText);
+        })
         .then((data: { path: string }) => {
+          mutationEvent({ kind: "image-upload" });
           const mdLink = `![](${data.path})`;
-          const matches = model.findMatches(placeholder, false, false, true, null, true);
+          const targetModel = uploadDocument?.model;
+          if (!targetModel || targetModel.isDisposed?.()) return;
+          const matches = targetModel.findMatches(placeholder, false, false, true, null, true);
           if (matches.length > 0) {
-            editor.executeEdits("paste-image", [{ range: matches[0].range, text: mdLink }]);
+            applyModelEdit(targetModel, "paste-image", matches[0].range, mdLink);
           }
         })
         .catch(() => {
-          const matches = model.findMatches(placeholder, false, false, true, null, true);
+          const targetModel = uploadDocument?.model;
+          if (!targetModel || targetModel.isDisposed?.()) return;
+          const matches = targetModel.findMatches(placeholder, false, false, true, null, true);
           if (matches.length > 0) {
-            editor.executeEdits("paste-image", [{ range: matches[0].range, text: "![upload failed]()" }]);
+            applyModelEdit(targetModel, "paste-image", matches[0].range, "![upload failed]()");
           }
         });
     }, { capture: true });
 
-    S.setGetEditorValue(() => model.getValue());
+    S.setGetEditorValue(() => activeModel ? model.getValue() : "");
     S.setApplyEditorEdit((oldText: string, newText: string): boolean => {
+      if (!activeModel) return false;
       const matches = model.findMatches(oldText, false, false, true, null, true);
       if (matches.length === 0) return false;
       editor.executeEdits("ai-fix", [{ range: matches[0].range, text: newText }]);
       return true;
     });
+    saveRetry.addEventListener("click", () => {
+      if (activeDocument) {
+        if (activeDocument.retryTimer) clearTimeout(activeDocument.retryTimer);
+        activeDocument.retryTimer = null;
+        void saveDocument(activeDocument);
+      }
+    });
+
+    function renameDocument(oldPath: string, newPath: string, url: string) {
+      const doc = documents.get(oldPath);
+      if (!doc) return;
+      const content = doc.model.getValue();
+      const wasActive = doc === activeDocument;
+      if (wasActive) {
+        doc.viewState = editor.saveViewState();
+        editor.setModel(null);
+      }
+      const replacement = monaco.editor.createModel(content, "markdown", monaco.Uri.parse(`inmemory://post/${newPath}`));
+      doc.model.dispose();
+      documents.delete(oldPath);
+      doc.path = newPath;
+      doc.url = url;
+      doc.model = replacement;
+      doc.failed = false;
+      if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      doc.retryTimer = null;
+      doc.decorations = [];
+      replacement.onDidChangeContent(() => handleModelChange(doc));
+      documents.set(newPath, doc);
+      if (wasActive) {
+        activeModel = replacement;
+        editor.setModel(replacement);
+        gutterDecorations = [];
+        if (doc.viewState) editor.restoreViewState(doc.viewState);
+        localStorage.setItem("blogger-selected-post", newPath);
+        window.dispatchEvent(new CustomEvent("blogger-post-selected", { detail: { path: newPath, url } }));
+        updateGutterIcons();
+      }
+    }
+
+    function disposeDocument(path: string) {
+      const doc = documents.get(path);
+      if (!doc) return;
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      documents.delete(path);
+      doc.deleted = true;
+      if (doc === activeDocument) clearSelection(false);
+      doc.model.dispose();
+    }
+
+    const controller: PostDocumentController = {
+      async initializeSelection() {
+        const remembered = localStorage.getItem("blogger-selected-post");
+        if (remembered) {
+          try {
+            if (await openPost(remembered)) return;
+          } catch {
+            // The archive remains available when the remembered post cannot load.
+          }
+        }
+        clearSelection(true);
+      },
+      openPost,
+      async flush(path) {
+        const doc = path ? documents.get(path) : activeDocument;
+        if (!doc) return true;
+        return flushDocument(doc);
+      },
+      isDirty(path) { return documents.get(path)?.dirty ?? false; },
+      async getRevision(path) {
+        const doc = documents.get(path);
+        if (doc) return doc.revision;
+        return (await api<PostResponse>(`/api/post?path=${encodeURIComponent(path)}`)).revision;
+      },
+      getActivePath() { return activeDocument?.path ?? null; },
+      renameDocument,
+      disposeDocument,
+      clearSelection,
+      checkActiveRevision,
+      setArchiveOpener(opener) { archiveOpener = opener; },
+    };
+    clearSelection(false);
+    resolve(controller);
+  });
   });
 }

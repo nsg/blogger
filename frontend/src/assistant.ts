@@ -2,7 +2,7 @@ declare const marked: {
   parse: (src: string) => string;
 };
 
-import { ChatMessage } from "./types.js";
+import type { ChatMessage } from "./types.js";
 import * as S from "./state.js";
 
 function escapeHtml(s: string): string {
@@ -184,6 +184,11 @@ export function initAssistant() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: history }),
       });
+
+      if (res.status === 401) {
+        location.reload();
+        return;
+      }
 
       removeTypingIndicator();
 

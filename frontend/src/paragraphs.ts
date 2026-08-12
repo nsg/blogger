@@ -1,4 +1,4 @@
-import { ParsedParagraph } from "./types.js";
+import type { ParsedParagraph } from "./types.js";
 import * as S from "./state.js";
 
 export function hashString(s: string): string {
@@ -138,6 +138,7 @@ export async function requestSuggestion(paragraphId: string) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages }),
     });
+    if (res.status === 401) { location.reload(); return; }
     if (!res.ok) { S.setSuggestionInFlight(false); S.setProcessingParagraphId(null); if (S.onProcessingChanged) S.onProcessingChanged(); if (S.hideFeedbackIndicator) S.hideFeedbackIndicator(); return; }
     const data = await res.json();
 
@@ -217,6 +218,7 @@ export async function requestVoiceCommand(paragraphId: string, prompt: string) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages }),
     });
+    if (res.status === 401) { location.reload(); return; }
     if (!res.ok) return;
     const data = await res.json();
 

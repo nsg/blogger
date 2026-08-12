@@ -100,19 +100,21 @@ export function initResponsivePreviewPane() {
     }
 
     const workspaceWidth = workspace.getBoundingClientRect().width;
+    const archiveWidth = (document.getElementById("archive-panel")?.getBoundingClientRect().width || 0);
     const rightPaneVisible = !rightPane.classList.contains("collapsed");
     const preferredAssistantWidth = rightPaneVisible
       ? Math.min(WIDE_ASSISTANT_WIDTH, Math.max(MIN_ASSISTANT_WIDTH, workspaceWidth * 0.28))
       : 0;
 
-    const width = choosePreviewWidth(workspaceWidth, rightPaneVisible);
+    const availableWorkspaceWidth = Math.max(0, workspaceWidth - archiveWidth);
+    const width = choosePreviewWidth(availableWorkspaceWidth, rightPaneVisible);
 
     leftPane.style.flex = `0 0 ${width}px`;
     leftPane.dataset.previewWidth = `${width}`;
 
     if (rightPaneVisible) {
       const remainingWidth =
-        workspaceWidth - width - TARGET_EDITOR_WIDTH - DIVIDER_WIDTH * 2;
+        availableWorkspaceWidth - width - TARGET_EDITOR_WIDTH - DIVIDER_WIDTH * 2;
       const assistantWidth = Math.max(
         MIN_ASSISTANT_WIDTH,
         Math.min(preferredAssistantWidth, remainingWidth)
@@ -342,34 +344,37 @@ export function initUrlBar() {
 export async function initPreview() {
   const iframe = document.getElementById("ref-iframe") as HTMLIFrameElement;
   const input = document.getElementById("url-input") as HTMLInputElement;
-
+  let selectedPath: string | null = null;
   let previewUrl: string | null = null;
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    try {
-      const res = await fetch("/api/preview");
-      if (res.ok) {
-        const data = await res.json();
-        if (data.url) {
-          previewUrl = data.url;
-          iframe.src = data.url;
-          input.value = data.url;
-          break;
-        }
-      }
-    } catch {
-      // server not ready yet
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  if (!previewUrl) return;
-
   let lastContentLength: string | null = null;
 
+  window.addEventListener("blogger-post-selected", (event: Event) => {
+    const detail = (event as CustomEvent<{ path: string | null; url: string | null }>).detail;
+    selectedPath = detail.path;
+    previewUrl = detail.url ? `/preview-site${detail.url}` : null;
+    lastContentLength = null;
+    if (previewUrl) {
+      iframe.src = previewUrl;
+      input.value = previewUrl;
+      iframe.removeAttribute("aria-disabled");
+    } else {
+      iframe.src = "placeholder.html";
+      input.value = "";
+      iframe.setAttribute("aria-disabled", "true");
+    }
+  });
+  window.addEventListener("blogger-preview-refresh", () => {
+    if (previewUrl) iframe.src = previewUrl;
+  });
+
   setInterval(async () => {
+    if (!selectedPath || !previewUrl) return;
     try {
-      const res = await fetch("/api/preview-check");
+      const res = await fetch(`/api/preview-check?path=${encodeURIComponent(selectedPath)}`);
+      if (res.status === 401) {
+        location.reload();
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
       const cl = data.content_length as string | null;
@@ -384,4 +389,16 @@ export async function initPreview() {
       // ignore poll errors
     }
   }, 2000);
+}
+
+export function initLogout() {
+  const button = document.getElementById("logout") as HTMLButtonElement;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await fetch("/auth/logout", { method: "POST" });
+    } finally {
+      location.reload();
+    }
+  });
 }
