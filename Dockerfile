@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 node:22-bookworm-slim AS frontend
+FROM node:22-bookworm-slim AS frontend
 
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -6,7 +6,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM --platform=linux/amd64 rust:1-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -14,9 +14,9 @@ COPY src/ ./src/
 COPY --from=frontend /build/frontend/dist/ ./frontend/dist/
 RUN cargo build --release --locked
 
-FROM --platform=linux/amd64 ghcr.io/getzola/zola:v0.22.1 AS zola
+FROM ghcr.io/getzola/zola:v0.22.1 AS zola
 
-FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
