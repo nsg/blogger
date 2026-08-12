@@ -25,6 +25,16 @@ pub async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ready = *state.ready.borrow();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(json!({ "ready": ready })))
+}
+
 async fn ollama_chat(state: &AppState, payload: &Value) -> Result<Value, ApiErr> {
     let res = state
         .http
@@ -193,54 +203,6 @@ pub async fn web_fetch(
     Ok(Json(result))
 }
 
-pub async fn preview_check(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let base_url = state.preview_url.borrow().clone();
-    let slug = preview_slug(&state);
-
-    let url = match (&base_url, &slug) {
-        (Some(base), Some(s)) => format!("{}{}", base.trim_end_matches('/'), s),
-        (Some(base), None) => base.clone(),
-        _ => return Json(json!({ "content_length": null })),
-    };
-
-    let cl = state
-        .http
-        .head(&url)
-        .send()
-        .await
-        .ok()
-        .filter(|r| r.status().is_success())
-        .and_then(|r| r.headers().get("content-length").cloned())
-        .and_then(|v| v.to_str().ok().map(String::from))
-        .filter(|v| v != "0");
-
-    Json(json!({ "content_length": cl }))
-}
-
-fn preview_slug(state: &AppState) -> Option<String> {
-    state.initial_file.as_ref().and_then(|(path, _)| {
-        let path_str = path.to_string_lossy();
-        let content_marker = "/content/";
-        let idx = path_str.find(content_marker)?;
-        let relative = &path_str[idx + content_marker.len()..];
-        let stem = relative.strip_suffix(".md").unwrap_or(relative);
-        Some(format!("/{stem}/"))
-    })
-}
-
-pub async fn preview(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let base_url = state.preview_url.borrow().clone();
-    let slug = preview_slug(&state);
-
-    let url = match (&base_url, &slug) {
-        (Some(_), Some(s)) => Some(format!("/preview-site{}", s)),
-        (Some(_), None) => Some("/preview-site/".to_string()),
-        _ => None,
-    };
-
-    Json(json!({ "url": url }))
-}
-
 fn rewrite_preview_html(html: &str) -> String {
     html.replace("href=\"/", "href=\"/preview-site/")
         .replace("src=\"/", "src=\"/preview-site/")
@@ -264,9 +226,9 @@ fn rewrite_preview_css(css: &str) -> String {
 async fn proxy_preview_path(state: Arc<AppState>, path: &str) -> Response {
     let path = path.trim_start_matches('/');
     let url = if path.is_empty() {
-        "http://localhost:1111/".to_string()
+        "http://127.0.0.1:1111/".to_string()
     } else {
-        format!("http://localhost:1111/{path}")
+        format!("http://127.0.0.1:1111/{path}")
     };
 
     let Ok(res) = state.http.get(url).send().await else {
@@ -329,77 +291,6 @@ pub async fn preview_site_path(
     proxy_preview_path(state, &path).await
 }
 
-pub async fn initial_content(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let document = state.document.read().await;
-    match &state.initial_file {
-        Some((path, _)) => Json(json!({
-            "path": path.display().to_string(),
-            "content": document.content.clone(),
-            "revision": document.revision,
-        })),
-        None => Json(json!({
-            "path": null,
-            "content": if document.revision > 1 {
-                Value::String(document.content.clone())
-            } else {
-                Value::Null
-            },
-            "revision": document.revision,
-        })),
-    }
-}
-
-pub async fn document_state(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let document = state.document.read().await;
-    Json(json!({
-        "content": document.content.clone(),
-        "revision": document.revision,
-        "has_file": state.initial_file.is_some(),
-    }))
-}
-
-pub async fn save_file(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiErr> {
-    let path = state.initial_file.as_ref().map(|(path, _)| path.clone());
-
-    let content = body
-        .get("content")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing 'content' field" })),
-            )
-        })?;
-
-    if let Some(path) = path {
-        let dir = path.parent().unwrap_or(std::path::Path::new("."));
-        let tmp = dir.join(format!(".blogger-save-{}.tmp", std::process::id()));
-        std::fs::write(&tmp, content).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to write temp file: {e}") })),
-            )
-        })?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to rename file: {e}") })),
-            )
-        })?;
-    }
-
-    let mut document = state.document.write().await;
-    document.content = content.to_string();
-    document.revision += 1;
-    let revision = document.revision;
-
-    Ok(Json(json!({ "ok": true, "revision": revision })))
-}
-
 fn multipart_boundary() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -457,15 +348,6 @@ pub async fn transcribe(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, ApiErr> {
-    if state.stt_api_key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "error": "missing STT API key; run `blogger set-stt-key` or set OPENAI_API_KEY" }),
-            ),
-        ));
-    }
-
     let field = multipart.next_field().await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -535,13 +417,6 @@ pub async fn upload_image(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, ApiErr> {
-    let site_root = state.site_root.as_ref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "no site root configured" })),
-        )
-    })?;
-
     let field = multipart.next_field().await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -588,7 +463,7 @@ pub async fn upload_image(
         .collect();
     let filename = format!("{timestamp}-{sanitized}");
 
-    let dir = site_root.join("site/static/images").join(&year);
+    let dir = state.zola_root.join("static/images").join(&year);
     std::fs::create_dir_all(&dir).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -610,8 +485,8 @@ pub async fn upload_image(
 
 fn resolve_image_path(site_root: &std::path::Path, image_path: &str) -> Option<std::path::PathBuf> {
     let relative = image_path.strip_prefix('/')?;
-    let full = site_root.join("site/static").join(relative);
-    if !full.starts_with(site_root.join("site/static/images")) {
+    let full = site_root.join("static").join(relative);
+    if !full.starts_with(site_root.join("static/images")) {
         return None;
     }
     Some(full)
@@ -621,13 +496,6 @@ pub async fn rename_image(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
-    let site_root = state.site_root.as_ref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "no site root configured" })),
-        )
-    })?;
-
     let old_path = body
         .get("old_path")
         .and_then(|v| v.as_str())
@@ -647,7 +515,7 @@ pub async fn rename_image(
             )
         })?;
 
-    let src = resolve_image_path(site_root, old_path).ok_or_else(|| {
+    let src = resolve_image_path(&state.zola_root, old_path).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid image path" })),
@@ -690,13 +558,6 @@ pub async fn delete_image(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
-    let site_root = state.site_root.as_ref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "no site root configured" })),
-        )
-    })?;
-
     let image_path = body.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -704,7 +565,7 @@ pub async fn delete_image(
         )
     })?;
 
-    let full = resolve_image_path(site_root, image_path).ok_or_else(|| {
+    let full = resolve_image_path(&state.zola_root, image_path).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid image path" })),

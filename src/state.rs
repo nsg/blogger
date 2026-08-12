@@ -1,21 +1,21 @@
-pub struct AuthState {
-    pub pin: String,
-    pub pin_expires_at: std::time::Instant,
-    pub session_token: String,
-}
+use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-pub struct DocumentState {
-    pub content: String,
-    pub revision: u64,
-}
+use crate::{config::Config, zola::ZolaChild};
 
 pub struct AppState {
-    pub ollama_key: String,
-    pub stt_api_key: String,
-    pub auth: AuthState,
+    pub config: Config,
     pub http: reqwest::Client,
-    pub preview_url: tokio::sync::watch::Receiver<Option<String>>,
-    pub initial_file: Option<(std::path::PathBuf, String)>,
-    pub site_root: Option<std::path::PathBuf>,
-    pub document: tokio::sync::RwLock<DocumentState>,
+    pub zola_root: PathBuf,
+    pub ready: tokio::sync::watch::Receiver<bool>,
+    #[allow(dead_code)]
+    pub coordinator: tokio::sync::Mutex<()>,
+    pub zola: Arc<ZolaChild>,
+}
+
+impl Deref for AppState {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
 }

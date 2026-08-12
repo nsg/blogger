@@ -1,25 +1,35 @@
 use std::{
-    io::Read,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{Request, State},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
 };
+use hmac::{Hmac, KeyInit, Mac};
+use serde_json::{Value, json};
+use sha2::Sha256;
 
-use crate::state::{AppState, AuthState};
+use crate::state::AppState;
 
 const AUTH_COOKIE: &str = "blogger_session";
-const KEYRING_SERVICE: &str = "blogger";
-const SESSION_KEYRING_USER: &str = "remote_session_token";
-const SESSION_COOKIE_MAX_AGE_SECS: u64 = 180 * 24 * 60 * 60;
-const PIN_TTL: Duration = Duration::from_secs(120);
+const SESSION_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_LOGIN_FAILURES: u8 = 5;
+const LOGIN_BLOCK_DURATION: Duration = Duration::from_secs(60);
+
+struct LoginLimiter {
+    failures: u8,
+    blocked_until: Option<Instant>,
+}
+
+static LOGIN_LIMITER: Mutex<LoginLimiter> = Mutex::new(LoginLimiter {
+    failures: 0,
+    blocked_until: None,
+});
 
 fn token_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
@@ -33,310 +43,252 @@ fn token_eq(left: &str, right: &str) -> bool {
     diff == 0
 }
 
-fn fill_random(bytes: &mut [u8]) {
-    match std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(bytes)) {
-        Ok(()) => {}
-        Err(_) => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ((nanos >> ((i % 16) * 8)) as u8) ^ (std::process::id() as u8) ^ (i as u8);
-            }
-        }
-    }
-}
-
-fn random_hex<const N: usize>() -> String {
-    let mut bytes = [0_u8; N];
-    fill_random(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn generate_pin() -> String {
-    let mut bytes = [0_u8; 4];
-    fill_random(&mut bytes);
-    let value = u32::from_ne_bytes(bytes) % 1_000_000;
-    format!("{value:06}")
-}
-
-fn is_valid_session_token(token: &str) -> bool {
-    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn load_session_token() -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, SESSION_KEYRING_USER).ok()?;
-    match entry.get_password() {
-        Ok(token) if is_valid_session_token(&token) => Some(token),
-        Ok(_) => {
-            eprintln!("warning: stored remote session token was invalid; rotating it");
-            None
-        }
-        Err(_) => None,
-    }
-}
-
-fn store_session_token(token: &str) {
-    match keyring::Entry::new(KEYRING_SERVICE, SESSION_KEYRING_USER) {
-        Ok(entry) => {
-            if let Err(e) = entry.set_password(token) {
-                eprintln!("warning: failed to persist remote session token in keyring: {e}");
-            }
-        }
-        Err(e) => eprintln!("warning: keyring unavailable for remote session token: {e}"),
-    }
-}
-
-fn session_token() -> String {
-    if let Some(token) = load_session_token() {
-        return token;
-    }
-
-    let token = random_hex::<32>();
-    store_session_token(&token);
-    token
-}
-
-pub fn format_pin(pin: &str) -> String {
-    pin.as_bytes()
-        .chunks(2)
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn new_auth_state() -> AuthState {
-    AuthState {
-        pin: generate_pin(),
-        pin_expires_at: Instant::now() + PIN_TTL,
-        session_token: session_token(),
-    }
-}
-
-pub fn pin_seconds_remaining(auth: &AuthState) -> u64 {
-    auth.pin_expires_at
-        .saturating_duration_since(Instant::now())
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
         .as_secs()
 }
 
-fn cookie_token(headers: &axum::http::HeaderMap) -> Option<&str> {
-    let value = headers.get(header::COOKIE)?.to_str().ok()?;
-    value.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == AUTH_COOKIE).then_some(value)
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn session_signature(secret: &[u8; 32], expiry: u64) -> String {
+    let message = format!("v1.{expiry}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
+    mac.update(message.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+fn sign_session(secret: &[u8; 32], expiry: u64) -> String {
+    format!("v1.{expiry}.{}", session_signature(secret, expiry))
+}
+
+fn verify_session(value: &str, secret: &[u8; 32], now: u64) -> bool {
+    let mut parts = value.split('.');
+    let Some(version) = parts.next() else {
+        return false;
+    };
+    let Some(expiry_text) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || version != "v1" {
+        return false;
+    }
+
+    let Ok(expiry) = expiry_text.parse::<u64>() else {
+        return false;
+    };
+    if expiry <= now {
+        return false;
+    }
+
+    token_eq(signature, &session_signature(secret, expiry))
+}
+
+fn cookie_value(headers: &HeaderMap) -> Option<&str> {
+    headers.get_all(header::COOKIE).iter().find_map(|value| {
+        value.to_str().ok()?.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name == AUTH_COOKIE).then_some(value)
+        })
     })
 }
 
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ")
+fn session_cookie(secret: &[u8; 32], now: u64) -> String {
+    let expiry = now.saturating_add(SESSION_LIFETIME_SECS);
+    let value = sign_session(secret, expiry);
+    format!(
+        "{AUTH_COOKIE}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_LIFETIME_SECS}"
+    )
 }
 
-fn is_localhost_addr(addr: SocketAddr) -> bool {
-    is_localhost_ip(addr.ip())
+fn logout_cookie() -> String {
+    format!("{AUTH_COOKIE}=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
 }
 
-fn is_localhost_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback(),
-        IpAddr::V6(ip) => ip.is_loopback(),
+fn decode_form_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char).to_digit(16)?;
+                let low = (bytes[index + 2] as char).to_digit(16)?;
+                decoded.push(((high << 4) | low) as u8);
+                index += 2;
+            }
+            b'%' => return None,
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn form_password(body: &[u8]) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    body.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        (decode_form_component(name).as_deref() == Some("password"))
+            .then(|| decode_form_component(value))
+            .flatten()
+    })
+}
+
+fn json_password(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("password")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn request_password(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim();
+    match content_type {
+        "application/x-www-form-urlencoded" => form_password(body),
+        "application/json" => json_password(body),
+        _ => None,
     }
 }
 
-fn first_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
-    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let first = value.split(',').next()?.trim();
-    first.parse().ok()
-}
+fn login_allowed(password: Option<&str>, expected: &str) -> bool {
+    let now = Instant::now();
+    let mut limiter = LOGIN_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
 
-fn forwarded_proto_is_https(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .next()
-                .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
-        })
-}
-
-fn request_is_localhost(request: &Request<Body>) -> bool {
-    if let Some(ip) = first_forwarded_for(request.headers()) {
-        return is_localhost_ip(ip);
+    if let Some(blocked_until) = limiter.blocked_until {
+        if now < blocked_until {
+            return false;
+        }
+        limiter.failures = 0;
+        limiter.blocked_until = None;
     }
 
-    request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ConnectInfo(addr)| is_localhost_addr(*addr))
+    if password.is_some_and(|password| token_eq(password, expected)) {
+        limiter.failures = 0;
+        limiter.blocked_until = None;
+        return true;
+    }
+
+    limiter.failures = limiter.failures.saturating_add(1);
+    if limiter.failures >= MAX_LOGIN_FAILURES {
+        limiter.blocked_until = Some(now + LOGIN_BLOCK_DURATION);
+    }
+    false
 }
 
-fn has_session(headers: &axum::http::HeaderMap, session_token: &str) -> bool {
-    cookie_token(headers).is_some_and(|token| token_eq(token, session_token))
-        || bearer_token(headers).is_some_and(|token| token_eq(token, session_token))
+fn incorrect_password() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({
+            "error": "Incorrect password"
+        })),
+    )
+        .into_response()
 }
 
-fn pin_form(message: &str, status: StatusCode) -> Response {
-    let html = format!(
-        r#"<!doctype html>
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let password = request_password(&headers, &body);
+    if !login_allowed(password.as_deref(), &state.config.password) {
+        return incorrect_password();
+    }
+
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            header::SET_COOKIE,
+            session_cookie(&state.config.session_secret, unix_now()),
+        )],
+    )
+        .into_response()
+}
+
+pub async fn logout() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, logout_cookie())],
+    )
+        .into_response()
+}
+
+fn login_page() -> Response {
+    const PAGE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Blogger PIN</title>
+  <title>Blogger Login</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
-    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #f9fafb; }}
-    main {{ width: min(24rem, calc(100vw - 2rem)); }}
-    label {{ display: block; margin-bottom: .5rem; font-weight: 650; }}
-    input {{ box-sizing: border-box; width: 100%; padding: .75rem; font-size: 1.25rem; letter-spacing: .2rem; }}
-    button {{ margin-top: .75rem; width: 100%; padding: .75rem; font: inherit; font-weight: 650; cursor: pointer; }}
-    p {{ color: #d1d5db; line-height: 1.5; }}
-    strong {{ color: #fff; font-size: 1.1rem; }}
-    .status {{ min-height: 1.5rem; }}
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #f9fafb; }
+    main { width: min(24rem, calc(100vw - 2rem)); }
+    label { display: block; margin-bottom: .5rem; font-weight: 650; }
+    input { box-sizing: border-box; width: 100%; padding: .75rem; font: inherit; background: #1f2937; color: inherit; border: 1px solid #4b5563; border-radius: .35rem; }
+    button { margin-top: .75rem; width: 100%; padding: .75rem; font: inherit; font-weight: 650; cursor: pointer; }
+    p { min-height: 1.5rem; color: #fca5a5; }
   </style>
 </head>
 <body>
   <main>
     <h1>Blogger</h1>
-    <p class="status" aria-live="polite">{message}</p>
-    <p>The terminal PIN is shown in bold as <strong>12 34 56</strong>.</p>
-    <form method="post" action="/auth/pin">
-      <label for="pin">PIN</label>
-      <input id="pin" name="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="12 34 56" autofocus required>
+    <form method="post" action="/auth/login">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
       <button type="submit">Continue</button>
+      <p id="status" aria-live="polite"></p>
     </form>
   </main>
+  <script>
+    document.querySelector("form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const response = await fetch("/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(new FormData(event.currentTarget))
+      });
+      if (response.status === 204) location.replace("/");
+      else document.querySelector("#status").textContent = "Incorrect password";
+    });
+  </script>
 </body>
-</html>"#
-    );
+</html>"##;
 
-    (
-        status,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
+    (StatusCode::UNAUTHORIZED, Html(PAGE)).into_response()
 }
 
-fn pin_prompt(expired: bool) -> Response {
-    if expired {
-        pin_form(
-            "The startup PIN has expired. Restart Blogger to generate a new PIN.",
-            StatusCode::FORBIDDEN,
-        )
-    } else {
-        pin_form(
-            "Enter the PIN shown in the Blogger terminal.",
-            StatusCode::OK,
-        )
-    }
-}
-
-fn unauthorized(request: &Request<Body>, expired: bool) -> Response {
-    if request.method() == axum::http::Method::GET {
-        return pin_prompt(expired);
+fn unauthorized(method: &Method) -> Response {
+    if method == Method::GET || method == Method::HEAD {
+        return login_page();
     }
 
     (
         StatusCode::UNAUTHORIZED,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "Unauthorized. Open the Blogger UI in a browser and enter the startup PIN.",
+        axum::Json(json!({ "error": "unauthorized" })),
     )
         .into_response()
-}
-
-fn parse_pin(body: &[u8]) -> Option<String> {
-    std::str::from_utf8(body).ok()?.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "pin").then(|| {
-            value
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .collect::<String>()
-        })
-    })
-}
-
-fn session_cookie(session_token: &str, secure: bool) -> String {
-    let mut cookie = format!(
-        "{AUTH_COOKIE}={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}"
-    );
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    cookie
-}
-
-fn pin_accepted(session_token: &str, secure_cookie: bool) -> Response {
-    let html = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Blogger PIN Accepted</title>
-  <meta http-equiv="refresh" content="1; url=/">
-  <style>
-    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #f9fafb; }
-    main { width: min(24rem, calc(100vw - 2rem)); }
-    p { color: #d1d5db; line-height: 1.5; }
-    a { color: #93c5fd; }
-  </style>
-  <script>setTimeout(() => location.replace("/"), 250);</script>
-</head>
-<body>
-  <main>
-    <h1>PIN accepted</h1>
-    <p>Your browser is now authorized. Opening Blogger...</p>
-    <p><a href="/">Continue</a></p>
-  </main>
-</body>
-</html>"#;
-
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                header::SET_COOKIE,
-                session_cookie(session_token, secure_cookie).as_str(),
-            ),
-        ],
-        html,
-    )
-        .into_response()
-}
-
-pub async fn submit_pin(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let pin_expired = pin_seconds_remaining(&state.auth) == 0;
-    let pin_is_valid =
-        !pin_expired && parse_pin(&body).is_some_and(|pin| token_eq(&pin, &state.auth.pin));
-
-    if pin_expired {
-        eprintln!("remote PIN attempt rejected: startup PIN expired");
-        return pin_prompt(true);
-    }
-
-    if !pin_is_valid {
-        eprintln!("remote PIN attempt rejected: incorrect PIN");
-        return pin_form(
-            "That PIN did not match. Check the terminal and try again.",
-            StatusCode::UNAUTHORIZED,
-        );
-    }
-
-    println!("remote PIN accepted; session cookie issued");
-    pin_accepted(
-        &state.auth.session_token,
-        forwarded_proto_is_https(&headers),
-    )
 }
 
 pub async fn require_auth(
@@ -345,39 +297,24 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if path == "/auth/pin" || path == "/api/health" {
+    if matches!(path, "/api/health" | "/api/ready" | "/auth/login") {
         return next.run(request).await;
     }
 
-    let is_localhost = request_is_localhost(&request);
-
-    if is_localhost || has_session(request.headers(), &state.auth.session_token) {
-        return next.run(request).await;
+    let authenticated = cookie_value(request.headers())
+        .is_some_and(|value| verify_session(value, &state.config.session_secret, unix_now()));
+    if authenticated {
+        next.run(request).await
+    } else {
+        unauthorized(request.method())
     }
-
-    unauthorized(&request, pin_seconds_remaining(&state.auth) == 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use super::{SESSION_LIFETIME_SECS, sign_session, token_eq, verify_session};
 
-    use super::{
-        SESSION_COOKIE_MAX_AGE_SECS, first_forwarded_for, format_pin, forwarded_proto_is_https,
-        is_localhost_addr, is_valid_session_token, parse_pin, session_cookie, token_eq,
-    };
-    use axum::http::{HeaderMap, HeaderValue};
-
-    #[test]
-    fn parses_pin_form_body() {
-        assert_eq!(parse_pin(b"pin=123456"), Some("123456".to_string()));
-        assert_eq!(parse_pin(b"pin=12+34+56"), Some("123456".to_string()));
-    }
-
-    #[test]
-    fn formats_pin_for_display() {
-        assert_eq!(format_pin("123456"), "12 34 56");
-    }
+    const SECRET: [u8; 32] = [0x5a; 32];
 
     #[test]
     fn compares_tokens() {
@@ -387,70 +324,31 @@ mod tests {
     }
 
     #[test]
-    fn validates_session_token_shape() {
-        assert!(is_valid_session_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    fn session_round_trip_and_expiry() {
+        let now = 1_700_000_000;
+        let expiry = now + SESSION_LIFETIME_SECS;
+        let session = sign_session(&SECRET, expiry);
+
+        assert!(verify_session(&session, &SECRET, now));
+        assert!(verify_session(&session, &SECRET, expiry - 1));
+        assert!(!verify_session(&session, &SECRET, expiry));
+        assert!(!verify_session(&session, &SECRET, expiry + 1));
+    }
+
+    #[test]
+    fn rejects_tampered_sessions() {
+        let now = 1_700_000_000;
+        let session = sign_session(&SECRET, now + SESSION_LIFETIME_SECS);
+        let mut tampered_signature = session.clone();
+        let last = tampered_signature.pop().expect("session has a signature");
+        tampered_signature.push(if last == '0' { '1' } else { '0' });
+
+        assert!(!verify_session(&tampered_signature, &SECRET, now));
+        assert!(!verify_session(
+            &session.replace("v1.", "v2."),
+            &SECRET,
+            now
         ));
-        assert!(!is_valid_session_token("abc123"));
-        assert!(!is_valid_session_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
-        ));
-    }
-
-    #[test]
-    fn session_cookie_is_persistent() {
-        let cookie = session_cookie(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            false,
-        );
-        assert!(cookie.contains("blogger_session="));
-        assert!(cookie.contains(&format!("Max-Age={SESSION_COOKIE_MAX_AGE_SECS}")));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(!cookie.contains("Secure"));
-    }
-
-    #[test]
-    fn secure_session_cookie_is_supported() {
-        let cookie = session_cookie(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            true,
-        );
-        assert!(cookie.ends_with("; Secure"));
-    }
-
-    #[test]
-    fn detects_forwarded_https() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert!(forwarded_proto_is_https(&headers));
-
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
-        assert!(!forwarded_proto_is_https(&headers));
-    }
-
-    #[test]
-    fn parses_first_forwarded_client_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("203.0.113.10, 127.0.0.1"),
-        );
-        assert_eq!(
-            first_forwarded_for(&headers),
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
-        );
-    }
-
-    #[test]
-    fn detects_loopback_addresses() {
-        assert!(is_localhost_addr(SocketAddr::from((
-            Ipv4Addr::LOCALHOST,
-            1
-        ))));
-        assert!(is_localhost_addr(SocketAddr::from((
-            Ipv6Addr::LOCALHOST,
-            1
-        ))));
-        assert!(!is_localhost_addr(SocketAddr::from(([192, 168, 1, 10], 1))));
+        assert!(!verify_session(&session, &[0xa5; 32], now));
     }
 }
