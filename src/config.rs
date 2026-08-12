@@ -4,11 +4,8 @@ pub struct Config {
     pub stt_api_key: String,
     pub password: String,
     pub session_secret: [u8; 32],
-    #[allow(dead_code)]
     pub github_token: String,
-    #[allow(dead_code)]
     pub git_name: String,
-    #[allow(dead_code)]
     pub git_email: String,
 }
 

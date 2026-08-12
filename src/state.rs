@@ -1,11 +1,12 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-use crate::{config::Config, zola::ZolaChild};
+use crate::{config::Config, git::Repository, zola::ZolaChild};
 
 pub struct AppState {
     pub config: Config,
     pub http: reqwest::Client,
     pub zola_root: PathBuf,
+    pub repository: Repository,
     pub ready: tokio::sync::watch::Receiver<bool>,
     pub coordinator: tokio::sync::Mutex<()>,
     pub zola: Arc<ZolaChild>,

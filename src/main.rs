@@ -1,6 +1,7 @@
 mod assets;
 mod auth;
 mod config;
+mod git;
 mod handlers;
 mod posts;
 mod site;
@@ -8,7 +9,7 @@ mod state;
 mod tools;
 mod zola;
 
-use std::{future::IntoFuture, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::IntoFuture, io::Write, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -20,13 +21,39 @@ use axum::{
 use config::Config;
 use state::AppState;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    if askpass() {
+        return;
+    }
     dotenvy::dotenv().ok();
-    if let Err(error) = run().await {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create Tokio runtime");
+    if let Err(error) = runtime.block_on(run()) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+}
+
+fn askpass() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    let prompt = if first.as_deref() == Some(std::ffi::OsStr::new("--askpass")) {
+        args.next().unwrap_or_default()
+    } else if std::env::var_os("BLOGGER_ASKPASS_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        first.unwrap_or_default()
+    } else {
+        return false;
+    };
+    let value = if prompt.to_string_lossy().starts_with("Username") {
+        "x-access-token".to_owned()
+    } else {
+        std::env::var("GITHUB_TOKEN").unwrap_or_default()
+    };
+    let _ = writeln!(std::io::stdout(), "{value}");
+    true
 }
 
 async fn run() -> Result<(), String> {
@@ -34,6 +61,7 @@ async fn run() -> Result<(), String> {
     let search_root = search_root()?;
     let zola_root = site::discover(&search_root)?;
     site::validate(&zola_root)?;
+    let repository = git::validate_repository(&zola_root, &config).await?;
 
     let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let zola = zola::spawn(&zola_root, ready_tx).await?;
@@ -41,6 +69,7 @@ async fn run() -> Result<(), String> {
         config,
         http: reqwest::Client::new(),
         zola_root,
+        repository,
         ready: ready_rx,
         coordinator: tokio::sync::Mutex::new(()),
         zola,
@@ -64,7 +93,12 @@ async fn run() -> Result<(), String> {
         .route("/post/rename", post(posts::rename))
         .route("/post/delete", post(posts::delete))
         .route("/post/recover", post(posts::recover))
-        .route("/preview-check", get(posts::preview_check));
+        .route("/preview-check", get(posts::preview_check))
+        .route("/git/status", get(git::status))
+        .route("/git/prepare", post(git::prepare))
+        .route("/git/commit-push", post(git::commit_push))
+        .route("/git/retry-push", post(git::retry_push))
+        .route("/git/sync", post(git::sync));
 
     let app = Router::new()
         .route("/auth/login", post(auth::login))
