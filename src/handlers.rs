@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    io::Write,
+    path::{Component, Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     Json,
@@ -463,16 +467,29 @@ pub async fn upload_image(
         .collect();
     let filename = format!("{timestamp}-{sanitized}");
 
-    let dir = state.zola_root.join("static/images").join(&year);
+    let _guard = state.coordinator.lock().await;
+    let images_root = ensure_images_root(&state.zola_root)?;
+    let dir = images_root.join(&year);
     std::fs::create_dir_all(&dir).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to create directory: {e}") })),
         )
     })?;
+    let dir = confined_image_parent(&images_root, &dir)?;
 
     let file_path = dir.join(&filename);
-    std::fs::write(&file_path, &data).map_err(|e| {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to create image: {e}") })),
+            )
+        })?;
+    file.write_all(&data).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to write image: {e}") })),
@@ -483,13 +500,121 @@ pub async fn upload_image(
     Ok(Json(json!({ "path": markdown_path })))
 }
 
-fn resolve_image_path(site_root: &std::path::Path, image_path: &str) -> Option<std::path::PathBuf> {
-    let relative = image_path.strip_prefix('/')?;
-    let full = site_root.join("static").join(relative);
-    if !full.starts_with(site_root.join("static/images")) {
-        return None;
+fn ensure_images_root(site_root: &FsPath) -> Result<PathBuf, ApiErr> {
+    let images_root = site_root.join("static/images");
+    let canonical_site_root = site_root.canonicalize().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to resolve site directory: {error}") })),
+        )
+    })?;
+    let mut existing_parent = images_root.as_path();
+    while !existing_parent.exists() {
+        existing_parent = existing_parent.parent().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "image directory has no existing parent" })),
+            )
+        })?;
     }
-    Some(full)
+    let canonical_existing_parent = existing_parent.canonicalize().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to resolve image directory: {error}") })),
+        )
+    })?;
+    if !canonical_existing_parent.starts_with(&canonical_site_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "image directory escapes the Zola root" })),
+        ));
+    }
+    std::fs::create_dir_all(&images_root).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to create image directory: {error}") })),
+        )
+    })?;
+    let images_root = images_root.canonicalize().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to resolve image directory: {error}") })),
+        )
+    })?;
+    if !images_root.starts_with(canonical_site_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "image directory escapes the Zola root" })),
+        ));
+    }
+    Ok(images_root)
+}
+
+fn confined_image_parent(images_root: &FsPath, parent: &FsPath) -> Result<PathBuf, ApiErr> {
+    let parent = parent.canonicalize().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid image path: {error}") })),
+        )
+    })?;
+    if !parent.starts_with(images_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        ));
+    }
+    Ok(parent)
+}
+
+fn resolve_image_path(images_root: &FsPath, image_path: &str) -> Result<PathBuf, ApiErr> {
+    if image_path.contains(['\\', '\0']) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        ));
+    }
+    let relative = image_path.strip_prefix("/images/").ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        )
+    })?;
+    let relative = FsPath::new(relative);
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() < 2
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        ));
+    }
+    let filename = relative.file_name().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        )
+    })?;
+    let parent = relative.parent().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image path" })),
+        )
+    })?;
+    let requested_parent = images_root.join(parent);
+    let mut existing_parent = requested_parent.as_path();
+    while !existing_parent.exists() {
+        existing_parent = existing_parent.parent().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid image path" })),
+            )
+        })?;
+    }
+    confined_image_parent(images_root, existing_parent)?;
+    Ok(requested_parent.join(filename))
 }
 
 pub async fn rename_image(
@@ -515,20 +640,6 @@ pub async fn rename_image(
             )
         })?;
 
-    let src = resolve_image_path(&state.zola_root, old_path).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid image path" })),
-        )
-    })?;
-
-    if !src.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "image not found" })),
-        ));
-    }
-
     let sanitized: String = new_name
         .chars()
         .map(|c| {
@@ -539,6 +650,37 @@ pub async fn rename_image(
             }
         })
         .collect();
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid image name" })),
+        ));
+    }
+
+    let _guard = state.coordinator.lock().await;
+    let images_root = ensure_images_root(&state.zola_root)?;
+    let src = resolve_image_path(&images_root, old_path)?;
+    match std::fs::symlink_metadata(&src) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "image path is not a file" })),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "image not found" })),
+            ));
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to inspect image: {error}") })),
+            ));
+        }
+    }
 
     let dir = src.parent().unwrap();
     let dest = dir.join(&sanitized);
@@ -549,7 +691,11 @@ pub async fn rename_image(
         )
     })?;
 
-    let parent_name = dir.file_name().unwrap_or_default().to_string_lossy();
+    let parent_name = FsPath::new(old_path)
+        .parent()
+        .and_then(FsPath::file_name)
+        .unwrap_or_default()
+        .to_string_lossy();
     let new_md_path = format!("/images/{parent_name}/{sanitized}");
     Ok(Json(json!({ "path": new_md_path })))
 }
@@ -565,20 +711,32 @@ pub async fn delete_image(
         )
     })?;
 
-    let full = resolve_image_path(&state.zola_root, image_path).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid image path" })),
-        )
-    })?;
+    let _guard = state.coordinator.lock().await;
+    let images_root = ensure_images_root(&state.zola_root)?;
+    let full = resolve_image_path(&images_root, image_path)?;
 
-    if full.exists() {
-        std::fs::remove_file(&full).map_err(|e| {
-            (
+    match std::fs::symlink_metadata(&full) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&full).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("delete failed: {e}") })),
+                )
+            })?;
+        }
+        Ok(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "image path is not a file" })),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("delete failed: {e}") })),
-            )
-        })?;
+                Json(json!({ "error": format!("failed to inspect image: {error}") })),
+            ));
+        }
     }
 
     Ok(Json(json!({ "ok": true })))

@@ -2,6 +2,7 @@ mod assets;
 mod auth;
 mod config;
 mod handlers;
+mod posts;
 mod site;
 mod state;
 mod tools;
@@ -54,7 +55,16 @@ async fn run() -> Result<(), String> {
         .route("/transcribe", post(handlers::transcribe))
         .route("/upload-image", post(handlers::upload_image))
         .route("/rename-image", post(handlers::rename_image))
-        .route("/delete-image", post(handlers::delete_image));
+        .route("/delete-image", post(handlers::delete_image))
+        .route("/posts", get(posts::list))
+        .route("/post", get(posts::load))
+        .route("/post/save", post(posts::save))
+        .route("/post/create", post(posts::create))
+        .route("/post/rename-preview", get(posts::rename_preview))
+        .route("/post/rename", post(posts::rename))
+        .route("/post/delete", post(posts::delete))
+        .route("/post/recover", post(posts::recover))
+        .route("/preview-check", get(posts::preview_check));
 
     let app = Router::new()
         .route("/auth/login", post(auth::login))

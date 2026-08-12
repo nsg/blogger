@@ -7,7 +7,6 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub zola_root: PathBuf,
     pub ready: tokio::sync::watch::Receiver<bool>,
-    #[allow(dead_code)]
     pub coordinator: tokio::sync::Mutex<()>,
     pub zola: Arc<ZolaChild>,
 }
