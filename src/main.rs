@@ -76,7 +76,7 @@ async fn run() -> Result<(), String> {
         zola_root,
         repository,
         ready: ready_rx,
-        coordinator: tokio::sync::Mutex::new(()),
+        coordinator: Arc::new(tokio::sync::Mutex::new(())),
         zola,
     });
 
@@ -129,6 +129,7 @@ async fn run() -> Result<(), String> {
     let (public_app, cancel_mcp) = oauth::public_router(
         oauth_state,
         state.zola_root.clone(),
+        state.coordinator.clone(),
         state.config.mcp_host.clone(),
     );
 

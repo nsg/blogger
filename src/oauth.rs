@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex as AsyncMutex;
 
 use axum::{
     Form, Json, Router,
@@ -27,7 +28,9 @@ use crate::{
 };
 
 const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
-const SCOPE: &str = "posts:read";
+const READ_SCOPE: &str = "posts:read";
+const WRITE_SCOPE: &str = "posts:write";
+const FULL_SCOPE: &str = "posts:read posts:write";
 const CODE_LIFETIME_SECS: u64 = 5 * 60;
 const ACCESS_LIFETIME_SECS: u64 = 60 * 60;
 const REFRESH_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
@@ -63,6 +66,7 @@ struct AuthorizationCode {
     redirect_uri: String,
     code_challenge: String,
     resource: String,
+    scope: String,
     expires_at: u64,
 }
 
@@ -71,6 +75,7 @@ struct TokenGrant {
     grant_id: String,
     client_id: String,
     resource: String,
+    scope: String,
     expires_at: u64,
 }
 
@@ -122,13 +127,18 @@ impl OAuthState {
         )
     }
 
-    fn validate_access_token(&self, token: &str, now: u64) -> bool {
+    fn validate_access_token(&self, token: &str, now: u64) -> Option<mcp::AccessScopes> {
         let mut grants = self.inner.grants.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut grants, now);
         grants
             .access_tokens
             .get(token)
-            .is_some_and(|grant| grant.expires_at > now && grant.resource == self.inner.public_url)
+            .filter(|grant| {
+                grant.expires_at > now
+                    && grant.resource == self.inner.public_url
+                    && has_scope(&grant.scope, READ_SCOPE)
+            })
+            .map(|grant| mcp::AccessScopes::new(has_scope(&grant.scope, WRITE_SCOPE)))
     }
 }
 
@@ -155,10 +165,15 @@ pub fn routes() -> Router<OAuthState> {
 pub fn public_router(
     state: OAuthState,
     zola_root: PathBuf,
+    coordinator: Arc<AsyncMutex<()>>,
     allowed_host: String,
 ) -> (Router, mcp::McpCancellation) {
-    let (mcp_service, cancel_mcp) =
-        mcp::http_service(zola_root, allowed_host.clone(), Default::default());
+    let (mcp_service, cancel_mcp) = mcp::http_service(
+        zola_root,
+        coordinator,
+        allowed_host.clone(),
+        Default::default(),
+    );
     let mcp_routes = Router::new().nest_service("/mcp", mcp_service).route_layer(
         middleware::from_fn_with_state(state.clone(), require_access_token),
     );
@@ -197,7 +212,7 @@ async fn protected_resource_metadata(State(state): State<OAuthState>) -> Respons
     no_store(Json(json!({
         "resource": state.inner.public_url,
         "authorization_servers": [state.inner.issuer],
-        "scopes_supported": [SCOPE],
+        "scopes_supported": [READ_SCOPE, WRITE_SCOPE],
         "bearer_methods_supported": ["header"],
     })))
 }
@@ -214,7 +229,7 @@ async fn authorization_server_metadata(State(state): State<OAuthState>) -> Respo
         "token_endpoint_auth_methods_supported": ["none"],
         "revocation_endpoint_auth_methods_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": [SCOPE],
+        "scopes_supported": [READ_SCOPE, WRITE_SCOPE],
     })))
 }
 
@@ -324,7 +339,7 @@ fn validate_authorize(state: &OAuthState, request: &AuthorizeRequest) -> Result<
     if request.response_type != "code" {
         return Err("unsupported response_type");
     }
-    if request.scope != SCOPE {
+    if !scope_eq(&request.scope, FULL_SCOPE) {
         return Err("invalid scope");
     }
     if request.resource != state.inner.public_url {
@@ -371,7 +386,7 @@ async fn authorize_page(
     })
     .collect::<String>();
     let page = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize Claude</h1><p>Allow read-only access to published and draft blog posts.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize Claude</h1><p>Allow access to read blog posts and create or edit drafts. Claude cannot publish, delete, commit, or push.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#
     );
     secure_html(Html(page))
 }
@@ -407,6 +422,7 @@ async fn authorize(
             .unwrap_or_else(|| CLAUDE_CALLBACK.to_owned()),
         code_challenge: request.code_challenge,
         resource: request.resource,
+        scope: FULL_SCOPE.to_owned(),
         expires_at: now + CODE_LIFETIME_SECS,
     };
     let mut grants = state.inner.grants.lock().unwrap_or_else(|e| e.into_inner());
@@ -487,7 +503,14 @@ fn exchange_code(state: &OAuthState, request: TokenRequest) -> Response {
     {
         return invalid_grant("authorization code validation failed");
     }
-    issue_tokens(state, grant.grant_id, grant.client_id, grant.resource, now)
+    issue_tokens(
+        state,
+        grant.grant_id,
+        grant.client_id,
+        grant.resource,
+        grant.scope,
+        now,
+    )
 }
 
 fn refresh_access(state: &OAuthState, request: TokenRequest) -> Response {
@@ -511,7 +534,10 @@ fn refresh_access(state: &OAuthState, request: TokenRequest) -> Response {
             .resource
             .as_deref()
             .is_some_and(|value| value != grant.resource)
-        || request.scope.as_deref().is_some_and(|value| value != SCOPE)
+        || request
+            .scope
+            .as_deref()
+            .is_some_and(|value| !scope_eq(value, &grant.scope))
     {
         return invalid_grant("refresh token validation failed");
     }
@@ -525,7 +551,14 @@ fn refresh_access(state: &OAuthState, request: TokenRequest) -> Response {
         },
     );
     drop(grants);
-    issue_tokens(state, grant.grant_id, grant.client_id, grant.resource, now)
+    issue_tokens(
+        state,
+        grant.grant_id,
+        grant.client_id,
+        grant.resource,
+        grant.scope,
+        now,
+    )
 }
 
 fn issue_tokens(
@@ -533,6 +566,7 @@ fn issue_tokens(
     grant_id: String,
     client_id: String,
     resource: String,
+    scope: String,
     now: u64,
 ) -> Response {
     let access_token = random_token();
@@ -549,6 +583,7 @@ fn issue_tokens(
             grant_id: grant_id.clone(),
             client_id: client_id.clone(),
             resource: resource.clone(),
+            scope: scope.clone(),
             expires_at: now + ACCESS_LIFETIME_SECS,
         },
     );
@@ -558,6 +593,7 @@ fn issue_tokens(
             grant_id,
             client_id,
             resource,
+            scope: scope.clone(),
             expires_at: now + REFRESH_LIFETIME_SECS,
         },
     );
@@ -567,7 +603,7 @@ fn issue_tokens(
         "token_type": "Bearer",
         "expires_in": ACCESS_LIFETIME_SECS,
         "refresh_token": refresh_token,
-        "scope": SCOPE,
+        "scope": scope,
     })))
 }
 
@@ -601,7 +637,7 @@ async fn revoke(State(state): State<OAuthState>, Form(request): Form<RevokeReque
 
 pub async fn require_access_token(
     State(state): State<OAuthState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let token = request
@@ -611,13 +647,14 @@ pub async fn require_access_token(
         .and_then(|value| value.split_once(' '))
         .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer").then_some(token))
         .filter(|token| !token.is_empty() && !token.contains(' '));
-    if token.is_some_and(|token| state.validate_access_token(token, unix_now())) {
+    if let Some(scopes) = token.and_then(|token| state.validate_access_token(token, unix_now())) {
+        request.extensions_mut().insert(scopes);
         return next.run(request).await;
     }
     let challenge = format!(
         "Bearer resource_metadata=\"{}\", scope=\"{}\"",
         state.resource_metadata_url(),
-        SCOPE
+        FULL_SCOPE
     );
     (
         StatusCode::UNAUTHORIZED,
@@ -625,6 +662,20 @@ pub async fn require_access_token(
         Json(json!({ "error": "invalid_token" })),
     )
         .into_response()
+}
+
+fn has_scope(granted: &str, required: &str) -> bool {
+    granted
+        .split_ascii_whitespace()
+        .any(|scope| scope == required)
+}
+
+fn scope_eq(left: &str, right: &str) -> bool {
+    let left = left.split_ascii_whitespace().collect::<Vec<_>>();
+    let right = right.split_ascii_whitespace().collect::<Vec<_>>();
+    left.len() == right.len()
+        && left.iter().all(|scope| right.contains(scope))
+        && right.iter().all(|scope| left.contains(scope))
 }
 
 fn invalid_grant(description: &'static str) -> Response {
@@ -765,7 +816,10 @@ fn valid_pkce_value(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLAUDE_CALLBACK, OAuthState, PasswordGate, html_escape, public_router};
+    use super::{
+        ACCESS_LIFETIME_SECS, AsyncMutex, CLAUDE_CALLBACK, FULL_SCOPE, OAuthState, PasswordGate,
+        READ_SCOPE, TokenGrant, html_escape, public_router, unix_now,
+    };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use reqwest::{Client, StatusCode, Url, header};
     use serde_json::{Value, json};
@@ -812,6 +866,19 @@ mod tests {
         assert!(!super::valid_pkce_value(&format!("{}+", "a".repeat(42))));
     }
 
+    #[test]
+    fn treats_oauth_scopes_as_an_unordered_set() {
+        assert!(super::scope_eq(
+            "posts:write posts:read",
+            "posts:read posts:write"
+        ));
+        assert!(!super::scope_eq("posts:read", "posts:read posts:write"));
+        assert!(!super::scope_eq(
+            "posts:read posts:read",
+            "posts:read posts:write"
+        ));
+    }
+
     struct TestSite(PathBuf);
 
     impl TestSite {
@@ -826,6 +893,11 @@ mod tests {
             fs::write(
                 path.join("content/post/2026/draft.md"),
                 "+++\ntitle = \"Voice Draft\"\ndate = 2026-08-12\ndraft = true\n+++\nA distinctive narwhal voice note.\n",
+            )
+            .unwrap();
+            fs::write(
+                path.join("content/post/2026/published.md"),
+                "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n+++\nPublic material.\n",
             )
             .unwrap();
             Self(path)
@@ -843,8 +915,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = state();
-        let (router, _cancel_mcp) =
-            public_router(state.clone(), site.0.clone(), address.to_string());
+        let (router, _cancel_mcp) = public_router(
+            state.clone(),
+            site.0.clone(),
+            Arc::new(AsyncMutex::new(())),
+            address.to_string(),
+        );
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
@@ -872,7 +948,7 @@ mod tests {
                 ("client_id", client_id),
                 ("redirect_uri", CLAUDE_CALLBACK),
                 ("response_type", "code"),
-                ("scope", "posts:read"),
+                ("scope", FULL_SCOPE),
                 ("state", state_value),
                 ("code_challenge", challenge),
                 ("code_challenge_method", "S256"),
@@ -906,6 +982,21 @@ mod tests {
         serde_json::from_str(data).unwrap()
     }
 
+    fn insert_read_only_token(state: &OAuthState) -> String {
+        let token = "test-read-only-access-token".to_owned();
+        state.inner.grants.lock().unwrap().access_tokens.insert(
+            token.clone(),
+            TokenGrant {
+                grant_id: "old-read-only-grant".to_owned(),
+                client_id: state.client_id(),
+                resource: state.inner.public_url.clone(),
+                scope: READ_SCOPE.to_owned(),
+                expires_at: unix_now() + ACCESS_LIFETIME_SECS,
+            },
+        );
+        token
+    }
+
     async fn mcp_post(
         client: &Client,
         base: &str,
@@ -926,8 +1017,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completes_oauth_and_read_only_mcp_flow() {
-        let (_site, base, _state, server) = start_test_server().await;
+    async fn completes_oauth_and_draft_writing_mcp_flow() {
+        let (site, base, state, server) = start_test_server().await;
         let client = test_client();
 
         let wrong_host = client
@@ -947,6 +1038,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(protected["resource"], "https://mcp.example.com/mcp");
+        assert_eq!(
+            protected["scopes_supported"],
+            json!(["posts:read", "posts:write"])
+        );
         let metadata: Value = client
             .get(format!("{base}/.well-known/oauth-authorization-server"))
             .send()
@@ -956,6 +1051,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata["code_challenge_methods_supported"][0], "S256");
+        assert_eq!(
+            metadata["scopes_supported"],
+            json!(["posts:read", "posts:write"])
+        );
 
         let registration = client
             .post(format!("{base}/register"))
@@ -982,14 +1081,16 @@ mod tests {
             .append_pair("client_id", &client_id)
             .append_pair("redirect_uri", CLAUDE_CALLBACK)
             .append_pair("response_type", "code")
-            .append_pair("scope", "posts:read")
+            .append_pair("scope", FULL_SCOPE)
             .append_pair("state", "claude-state")
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("resource", "https://mcp.example.com/mcp");
         let page = client.get(authorize_url).send().await.unwrap();
         assert_eq!(page.status(), StatusCode::OK);
-        assert!(page.text().await.unwrap().contains("Authorize Claude"));
+        let page = page.text().await.unwrap();
+        assert!(page.contains("Authorize Claude"));
+        assert!(page.contains("create or edit drafts"));
 
         let wrong = authorize_code(
             &client,
@@ -1027,6 +1128,7 @@ mod tests {
             .unwrap();
         assert_eq!(token_response.status(), StatusCode::OK);
         let tokens: Value = token_response.json().await.unwrap();
+        assert_eq!(tokens["scope"], FULL_SCOPE);
         let access = tokens["access_token"].as_str().unwrap();
         let refresh = tokens["refresh_token"].as_str().unwrap();
 
@@ -1054,6 +1156,15 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("oauth-protected-resource/mcp")
+        );
+        assert!(
+            unauthorized
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("posts:read posts:write")
         );
 
         let initialize = mcp_post(
@@ -1108,7 +1219,17 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["get_post", "search_posts"]);
+        assert_eq!(
+            names,
+            [
+                "append_draft",
+                "create_draft",
+                "edit_draft",
+                "get_post",
+                "replace_draft",
+                "search_posts"
+            ]
+        );
 
         let searched = mcp_post(
             &client,
@@ -1147,6 +1268,210 @@ mod tests {
                 .contains("distinctive narwhal")
         );
 
+        let created = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":5,"method":"tools/call",
+                "params":{"name":"create_draft","arguments":{
+                    "front_matter":"title = \"Voice Written Post\"\ndate = 2026-08-12\ndraft = false\n[taxonomies]\ntags = [\"voice\"]",
+                    "body":"Opening paragraph."
+                }}
+            }),
+        )
+        .await;
+        let created = sse_json(&created.text().await.unwrap());
+        assert_eq!(created["result"]["isError"], false);
+        let created = &created["result"]["structuredContent"];
+        assert_eq!(created["path"], "post/2026/voice-written-post.md");
+        assert_eq!(created["draft"], true);
+        assert!(
+            created["message"]
+                .as_str()
+                .unwrap()
+                .contains("Created draft")
+        );
+        let created_revision = created["revision"].as_str().unwrap().to_owned();
+
+        let read_only_access = insert_read_only_token(&state);
+        let denied_write = mcp_post(
+            &client,
+            &base,
+            &read_only_access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":6,"method":"tools/call",
+                "params":{"name":"append_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":created_revision,
+                    "text":"must not be written"
+                }}
+            }),
+        )
+        .await;
+        let denied_write = sse_json(&denied_write.text().await.unwrap());
+        assert_eq!(denied_write["result"]["isError"], true);
+        assert_eq!(
+            denied_write["result"]["structuredContent"]["error"],
+            "insufficient_scope"
+        );
+
+        let appended = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":"append_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":created_revision,
+                    "text":"Second paragraph.",
+                    "separator":"blank_line"
+                }}
+            }),
+        )
+        .await;
+        let appended = sse_json(&appended.text().await.unwrap());
+        assert_eq!(appended["result"]["isError"], false);
+        let appended_revision = appended["result"]["structuredContent"]["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let ambiguous = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":8,"method":"tools/call",
+                "params":{"name":"edit_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":appended_revision,
+                    "replacements":[
+                        {"old_text":"paragraph.","new_text":"must not be written"}
+                    ]
+                }}
+            }),
+        )
+        .await;
+        let ambiguous = sse_json(&ambiguous.text().await.unwrap());
+        assert_eq!(ambiguous["result"]["isError"], true);
+        assert_eq!(
+            ambiguous["result"]["structuredContent"]["error"],
+            "replacement_ambiguous"
+        );
+        assert_eq!(ambiguous["result"]["structuredContent"]["match_count"], 2);
+
+        let edited = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":9,"method":"tools/call",
+                "params":{"name":"edit_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":appended_revision,
+                    "replacements":[
+                        {"old_text":"Opening paragraph.","new_text":"Revised opening."},
+                        {"old_text":"Second paragraph.","new_text":"Revised ending."}
+                    ]
+                }}
+            }),
+        )
+        .await;
+        let edited = sse_json(&edited.text().await.unwrap());
+        assert_eq!(edited["result"]["isError"], false);
+        let edited_revision = edited["result"]["structuredContent"]["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let stale = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":10,"method":"tools/call",
+                "params":{"name":"append_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":created_revision,
+                    "text":"stale"
+                }}
+            }),
+        )
+        .await;
+        let stale = sse_json(&stale.text().await.unwrap());
+        assert_eq!(stale["result"]["isError"], true);
+        assert_eq!(
+            stale["result"]["structuredContent"]["error"],
+            "revision_conflict"
+        );
+        assert_eq!(
+            stale["result"]["structuredContent"]["current_revision"],
+            edited_revision
+        );
+
+        let replaced = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":11,"method":"tools/call",
+                "params":{"name":"replace_draft","arguments":{
+                    "path":"post/2026/voice-written-post.md",
+                    "revision":edited_revision,
+                    "front_matter":"title = \"Final Voice Draft\"\ndate = 2026-08-12\ndraft = false\n[taxonomies]\ntags = [\"complete\"]",
+                    "body":"Final complete body."
+                }}
+            }),
+        )
+        .await;
+        let replaced = sse_json(&replaced.text().await.unwrap());
+        assert_eq!(replaced["result"]["isError"], false);
+        assert_eq!(replaced["result"]["structuredContent"]["draft"], true);
+
+        let published = crate::post_store::load_post(&site.0, "post/2026/published.md").unwrap();
+        let published_denied = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":12,"method":"tools/call",
+                "params":{"name":"append_draft","arguments":{
+                    "path":published.path,
+                    "revision":published.revision,
+                    "text":"must not change"
+                }}
+            }),
+        )
+        .await;
+        let published_denied = sse_json(&published_denied.text().await.unwrap());
+        assert_eq!(published_denied["result"]["isError"], true);
+        assert_eq!(
+            published_denied["result"]["structuredContent"]["error"],
+            "published_post"
+        );
+        assert_eq!(
+            crate::post_store::load_post(&site.0, "post/2026/published.md")
+                .unwrap()
+                .content,
+            "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n+++\nPublic material.\n"
+        );
+
+        let final_draft =
+            crate::post_store::load_post(&site.0, "post/2026/voice-written-post.md").unwrap();
+        assert_eq!(final_draft.title, "Final Voice Draft");
+        assert!(final_draft.draft);
+        assert!(final_draft.content.ends_with("+++\nFinal complete body."));
+
         for private_path in ["/", "/api/posts", "/auth/login", "/preview-site"] {
             let response = client
                 .get(format!("{base}{private_path}"))
@@ -1164,7 +1489,7 @@ mod tests {
                 ("client_id", client_id.as_str()),
                 ("refresh_token", refresh),
                 ("resource", "https://mcp.example.com/mcp"),
-                ("scope", "posts:read"),
+                ("scope", FULL_SCOPE),
             ])
             .send()
             .await

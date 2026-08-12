@@ -16,6 +16,8 @@ Run Blogger as a container in front of an existing Git checkout of the blog. Blo
 - Browse and manage posts from an archive panel.
 - Edit multiple posts with automatic saves and external-change conflict detection.
 - Create and preview draft posts.
+- Search, create, and revise drafts from Claude.ai chat or Claude Mobile voice
+  mode through the protected remote MCP connector.
 - Review writing with an AI assistant and insert speech-to-text dictation.
 - Preview the site through an authenticated live Zola view.
 - Commit all checkout changes and push them to GitHub manually.
@@ -125,24 +127,39 @@ blogger [SEARCH_ROOT]
 | Port | Access | Service |
 | --- | --- | --- |
 | 3000 | Private | Blogger web UI and authenticated preview proxy. |
-| 3001 | Public through HTTPS proxy | Read-only MCP connector and its OAuth endpoints. |
+| 3001 | Public through HTTPS proxy | MCP connector and its OAuth endpoints. |
 | 1111 | Internal on `127.0.0.1` | Zola live preview. Do not expose this port. |
 
 Use `GET /api/health` as the liveness probe. It reports that the Blogger process is serving requests. Use `GET /api/ready` as the readiness probe; it succeeds after the private Zola preview responds. Both endpoints are unauthenticated.
 
 ## Claude remote connector
 
-Blogger provides a read-only remote MCP connector for Claude.ai and Claude
-Mobile. It exposes two tools: `search_posts`, which searches titles and complete
-Markdown across both published posts and drafts, and `get_post`, which retrieves
-the complete Markdown for a search result. The tools cannot edit files or invoke
-Git operations.
+Blogger provides a remote MCP connector for Claude.ai and Claude Mobile. It
+exposes `search_posts` and `get_post` for reading published posts and drafts. It
+also exposes four draft-only writing tools:
+
+- `create_draft` creates a new draft from raw TOML front matter and a separate
+  Markdown body. The optional slug is generated from the title when omitted.
+- `append_draft` appends dictated text, with an optional newline or blank-line
+  separator.
+- `edit_draft` atomically applies exact, unique text replacements to the body.
+- `replace_draft` replaces the complete front matter and body.
+
+Send front matter as raw TOML without `+++` delimiters. Blogger validates it and
+always writes `draft = true`. Updates require the exact revision returned by
+`get_post` or the previous write, preventing silent overwrites. The connector
+cannot modify published posts, publish, delete, rename, manage images, commit,
+push, or access arbitrary files.
 
 Add the value of `BLOGGER_MCP_PUBLIC_URL` as a custom connector in Claude.ai.
 Claude discovers Blogger's OAuth endpoints automatically. The authorization page
 is served by Blogger and accepts `BLOGGER_PASSWORD`; the password is never sent
-to Claude. Authorization grants only the `posts:read` scope and cannot access the
-private web interface or REST API.
+to Claude. Authorization grants `posts:read` and `posts:write`. Write access is
+limited to drafts and cannot access the private web interface or REST API.
+
+After upgrading an existing read-only deployment, reauthorize the connector so
+Claude receives `posts:write`. Existing read-only tokens never acquire write
+access automatically.
 
 ### Deployment contract
 

@@ -1,6 +1,19 @@
-use std::{cmp::Ordering, fs, path::Path};
+use std::{
+    cmp::Ordering,
+    fmt,
+    fs::{self, OpenOptions},
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use chrono::{Datelike, Utc};
 use serde::Serialize;
+use tokio::sync::Mutex;
 
 use crate::site;
 
@@ -8,6 +21,7 @@ pub const MAX_SEARCH_RESULTS: usize = 20;
 
 const MAX_EXCERPT_CHARS: usize = 240;
 const EXCERPT_CONTEXT_CHARS: usize = 80;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PostDocument {
@@ -29,6 +43,301 @@ pub struct PostMatch {
     pub draft: bool,
     pub url: String,
     pub excerpt: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DraftStore {
+    zola_root: Arc<PathBuf>,
+    coordinator: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactReplacement {
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppendSeparator {
+    None,
+    Newline,
+    BlankLine,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DraftMutation {
+    pub message: String,
+    pub path: String,
+    pub title: String,
+    pub draft: bool,
+    pub url: String,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DraftError {
+    pub error: &'static str,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_count: Option<usize>,
+}
+
+impl fmt::Display for DraftError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl DraftStore {
+    pub fn new(zola_root: PathBuf, coordinator: Arc<Mutex<()>>) -> Self {
+        Self {
+            zola_root: Arc::new(zola_root),
+            coordinator,
+        }
+    }
+
+    pub fn load_post(&self, path: &str) -> Result<PostDocument, String> {
+        load_post(&self.zola_root, path)
+    }
+
+    pub fn search_posts(&self, query: &str, limit: usize) -> Result<Vec<PostMatch>, String> {
+        search_posts(&self.zola_root, query, limit)
+    }
+
+    pub async fn create_draft(
+        &self,
+        front_matter: &str,
+        body: &str,
+        requested_slug: Option<&str>,
+    ) -> Result<DraftMutation, DraftError> {
+        let prepared = prepare_document(front_matter, body)?;
+        let slug = match requested_slug {
+            Some(slug) => validate_slug(slug)?,
+            None => {
+                let generated = slug::slugify(&prepared.title);
+                if generated.is_empty() {
+                    return Err(draft_error(
+                        "invalid_slug",
+                        "The title cannot be converted into a filename slug. Supply a non-empty normalized slug.",
+                    ));
+                }
+                generated
+            }
+        };
+        let year = prepared
+            .date
+            .as_deref()
+            .and_then(date_year)
+            .unwrap_or_else(|| Utc::now().year());
+        let path = format!("post/{year}/{slug}.md");
+
+        let _guard = self.coordinator.lock().await;
+        let file = resolve_new_post(&self.zola_root, year, &slug)?;
+        if entry_exists(&file)? {
+            return Err(collision_error(&path));
+        }
+        ensure_url_available(&self.zola_root, &path, prepared.content.as_bytes(), None)?;
+        create_new_file(&file, prepared.content.as_bytes())?;
+
+        Ok(mutation(
+            format!("Created draft {:?} at {path}.", prepared.title),
+            &path,
+            &prepared.content,
+        ))
+    }
+
+    pub async fn replace_draft(
+        &self,
+        path: &str,
+        expected_revision: &str,
+        front_matter: &str,
+        body: &str,
+    ) -> Result<DraftMutation, DraftError> {
+        let prepared = prepare_document(front_matter, body)?;
+        self.update_draft(path, expected_revision, move |_, _| Ok(prepared.content))
+            .await
+            .map(|mut result| {
+                result.message = format!("Replaced draft {:?} at {path}.", result.title);
+                result
+            })
+    }
+
+    pub async fn edit_draft(
+        &self,
+        path: &str,
+        expected_revision: &str,
+        replacements: &[ExactReplacement],
+    ) -> Result<DraftMutation, DraftError> {
+        if replacements.is_empty() {
+            return Err(draft_error(
+                "invalid_replacements",
+                "Provide at least one exact body replacement.",
+            ));
+        }
+        self.update_draft(path, expected_revision, |content, body_start| {
+            let body = &content[body_start..];
+            let mut matches = Vec::with_capacity(replacements.len());
+            for (index, replacement) in replacements.iter().enumerate() {
+                if replacement.old_text.is_empty() {
+                    return Err(replacement_error(
+                        "invalid_replacement",
+                        "Replacement old_text must not be empty.",
+                        index,
+                        None,
+                    ));
+                }
+                let positions = body
+                    .match_indices(&replacement.old_text)
+                    .map(|(start, _)| start)
+                    .collect::<Vec<_>>();
+                if positions.len() != 1 {
+                    let message = if positions.is_empty() {
+                        format!(
+                            "Replacement {} did not match the draft body. Call get_post and retry with the exact current text.",
+                            index + 1
+                        )
+                    } else {
+                        format!(
+                            "Replacement {} matched {} places in the draft body. Provide a longer unique passage.",
+                            index + 1,
+                            positions.len()
+                        )
+                    };
+                    return Err(replacement_error(
+                        if positions.is_empty() {
+                            "replacement_not_found"
+                        } else {
+                            "replacement_ambiguous"
+                        },
+                        message,
+                        index,
+                        Some(positions.len()),
+                    ));
+                }
+                let start = positions[0];
+                matches.push((
+                    start,
+                    start + replacement.old_text.len(),
+                    index,
+                    replacement.new_text.as_str(),
+                ));
+            }
+            matches.sort_by_key(|entry| entry.0);
+            for pair in matches.windows(2) {
+                if pair[0].1 > pair[1].0 {
+                    return Err(replacement_error(
+                        "replacement_overlap",
+                        "Exact replacements overlap. Combine them into one replacement and retry.",
+                        pair[1].2,
+                        None,
+                    ));
+                }
+            }
+
+            let mut next_body = String::with_capacity(body.len());
+            let mut cursor = 0;
+            for (start, end, _, new_text) in matches {
+                next_body.push_str(&body[cursor..start]);
+                next_body.push_str(new_text);
+                cursor = end;
+            }
+            next_body.push_str(&body[cursor..]);
+            let mut next = content[..body_start].to_owned();
+            next.push_str(&next_body);
+            Ok(next)
+        })
+        .await
+        .map(|mut result| {
+            result.message = format!(
+                "Applied {} exact body replacement{} to draft {:?} at {path}.",
+                replacements.len(),
+                if replacements.len() == 1 { "" } else { "s" },
+                result.title
+            );
+            result
+        })
+    }
+
+    pub async fn append_draft(
+        &self,
+        path: &str,
+        expected_revision: &str,
+        text: &str,
+        separator: AppendSeparator,
+    ) -> Result<DraftMutation, DraftError> {
+        self.update_draft(path, expected_revision, |content, _| {
+            let separator = match separator {
+                AppendSeparator::None => "",
+                AppendSeparator::Newline => "\n",
+                AppendSeparator::BlankLine => "\n\n",
+            };
+            let mut next = String::with_capacity(content.len() + separator.len() + text.len());
+            next.push_str(content);
+            next.push_str(separator);
+            next.push_str(text);
+            Ok(next)
+        })
+        .await
+        .map(|mut result| {
+            result.message = format!("Appended text to draft {:?} at {path}.", result.title);
+            result
+        })
+    }
+
+    async fn update_draft(
+        &self,
+        path: &str,
+        expected_revision: &str,
+        update: impl FnOnce(&str, usize) -> Result<String, DraftError>,
+    ) -> Result<DraftMutation, DraftError> {
+        let _guard = self.coordinator.lock().await;
+        let file = resolve_existing_post(&self.zola_root, path)?;
+        let bytes = fs::read(&file)
+            .map_err(|_| draft_error("post_read_failed", "The draft could not be read safely."))?;
+        let content = String::from_utf8(bytes.clone()).map_err(|_| {
+            draft_error(
+                "invalid_post_encoding",
+                "The draft is not valid UTF-8 and cannot be modified through MCP.",
+            )
+        })?;
+        let current = site::metadata_from_bytes(path, &bytes);
+        if !current.draft {
+            return Err(draft_error(
+                "published_post",
+                "MCP may modify drafts only; this post is published and was not changed.",
+            ));
+        }
+        if expected_revision != current.revision {
+            return Err(DraftError {
+                error: "revision_conflict",
+                message: "The draft changed after it was read. Call get_post, review the current content, and retry with its new revision.".to_owned(),
+                current_revision: Some(current.revision),
+                replacement_index: None,
+                match_count: None,
+            });
+        }
+        let (_, _, body_start) = split_document(&content).map_err(|message| {
+            draft_error(
+                "invalid_front_matter",
+                format!("The existing draft has invalid front matter: {message}"),
+            )
+        })?;
+        let next = update(&content, body_start)?;
+        let next_metadata = site::metadata_from_bytes(path, next.as_bytes());
+        if !next_metadata.draft {
+            return Err(draft_error(
+                "draft_required",
+                "The requested change would remove draft status, so nothing was written.",
+            ));
+        }
+        ensure_url_available(&self.zola_root, path, next.as_bytes(), Some(path))?;
+        atomic_replace(&file, next.as_bytes())?;
+        Ok(mutation(String::new(), path, &next))
+    }
 }
 
 pub fn load_post(zola_root: &Path, path: &str) -> Result<PostDocument, String> {
@@ -57,7 +366,6 @@ pub fn load_post(zola_root: &Path, path: &str) -> Result<PostDocument, String> {
     let content =
         String::from_utf8(bytes.clone()).map_err(|_| format!("post is not valid UTF-8: {path}"))?;
     let metadata = site::metadata_from_bytes(path, &bytes);
-
     Ok(PostDocument {
         path: metadata.path,
         title: metadata.title,
@@ -113,6 +421,325 @@ pub fn search_posts(zola_root: &Path, query: &str, limit: usize) -> Result<Vec<P
             excerpt: entry.excerpt,
         })
         .collect())
+}
+
+struct PreparedDocument {
+    content: String,
+    title: String,
+    date: Option<String>,
+}
+
+fn prepare_document(front_matter: &str, body: &str) -> Result<PreparedDocument, DraftError> {
+    if front_matter.lines().any(|line| line.trim() == "+++") {
+        return Err(draft_error(
+            "invalid_front_matter",
+            "Front matter must be raw TOML without the surrounding +++ delimiters.",
+        ));
+    }
+    let mut table = toml::from_str::<toml::Table>(front_matter).map_err(|error| {
+        draft_error(
+            "invalid_front_matter",
+            format!(
+                "Front matter is not valid TOML: {error}. Send raw TOML without +++ delimiters."
+            ),
+        )
+    })?;
+    let title = table
+        .get("title")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            draft_error(
+                "invalid_front_matter",
+                "Front matter must contain a non-empty TOML string named title.",
+            )
+        })?;
+    let date = match table.get("date") {
+        Some(toml::Value::String(value)) => Some(value.clone()),
+        Some(toml::Value::Datetime(value)) => Some(value.to_string()),
+        Some(_) => {
+            return Err(draft_error(
+                "invalid_front_matter",
+                "The front matter date must be a TOML date, datetime, or string.",
+            ));
+        }
+        None => None,
+    };
+    table.insert("draft".to_owned(), toml::Value::Boolean(true));
+    let mut normalized = toml::to_string(&table).map_err(|error| {
+        draft_error(
+            "invalid_front_matter",
+            format!("Front matter could not be normalized: {error}"),
+        )
+    })?;
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    let content = format!("+++\n{normalized}+++\n{body}");
+    Ok(PreparedDocument {
+        content,
+        title,
+        date,
+    })
+}
+
+fn split_document(content: &str) -> Result<(&str, &str, usize), String> {
+    let mut offset = 0;
+    let mut lines = content.split_inclusive('\n');
+    let first = lines
+        .next()
+        .ok_or_else(|| "the document is empty".to_owned())?;
+    if first.trim_end_matches(['\r', '\n']) != "+++" {
+        return Err("the opening +++ delimiter is missing".to_owned());
+    }
+    offset += first.len();
+    let front_matter_start = offset;
+    for line in lines {
+        let line_start = offset;
+        offset += line.len();
+        if line.trim_end_matches(['\r', '\n']) == "+++" {
+            let front_matter =
+                content[front_matter_start..line_start].trim_end_matches(['\r', '\n']);
+            return Ok((front_matter, &content[offset..], offset));
+        }
+    }
+    Err("the closing +++ delimiter is missing".to_owned())
+}
+
+fn resolve_existing_post(zola_root: &Path, path: &str) -> Result<PathBuf, DraftError> {
+    let relative = site::validate_content_post_path(path)
+        .map_err(|message| draft_error("invalid_post_path", message))?;
+    let canonical_root = canonical_post_root(zola_root)?;
+    let file = zola_root.join("content").join(relative);
+    let canonical_file = file.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            draft_error("post_not_found", format!("No blog post exists at {path}."))
+        } else {
+            draft_error(
+                "post_read_failed",
+                "The post path could not be resolved safely.",
+            )
+        }
+    })?;
+    if canonical_file == canonical_root || !canonical_file.starts_with(&canonical_root) {
+        return Err(draft_error(
+            "invalid_post_path",
+            "The post path resolves outside content/post and was rejected.",
+        ));
+    }
+    if !canonical_file.is_file() {
+        return Err(draft_error(
+            "invalid_post_path",
+            "The post path is not a regular Markdown file.",
+        ));
+    }
+    Ok(canonical_file)
+}
+
+fn resolve_new_post(zola_root: &Path, year: i32, slug: &str) -> Result<PathBuf, DraftError> {
+    let canonical_root = canonical_post_root(zola_root)?;
+    let parent = zola_root.join("content/post").join(year.to_string());
+    match fs::create_dir(&parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(draft_error(
+                "post_create_failed",
+                "The draft year directory could not be created.",
+            ));
+        }
+    }
+    let canonical_parent = parent.canonicalize().map_err(|_| {
+        draft_error(
+            "post_create_failed",
+            "The draft year directory could not be resolved safely.",
+        )
+    })?;
+    if canonical_parent == canonical_root || !canonical_parent.starts_with(&canonical_root) {
+        return Err(draft_error(
+            "invalid_post_path",
+            "The generated draft path resolves outside content/post and was rejected.",
+        ));
+    }
+    Ok(canonical_parent.join(format!("{slug}.md")))
+}
+
+fn canonical_post_root(zola_root: &Path) -> Result<PathBuf, DraftError> {
+    zola_root.join("content/post").canonicalize().map_err(|_| {
+        draft_error(
+            "post_directory_unavailable",
+            "The blog post directory could not be resolved safely.",
+        )
+    })
+}
+
+fn validate_slug(slug: &str) -> Result<String, DraftError> {
+    if slug.is_empty() || slug::slugify(slug) != slug {
+        return Err(draft_error(
+            "invalid_slug",
+            "The slug must be a non-empty normalized slug such as my-new-post.",
+        ));
+    }
+    Ok(slug.to_owned())
+}
+
+fn date_year(date: &str) -> Option<i32> {
+    if !site::valid_post_date(date) {
+        return None;
+    }
+    date.get(..10)
+        .and_then(|prefix| chrono::NaiveDate::parse_from_str(prefix, "%Y-%m-%d").ok())
+        .map(|date| date.year())
+}
+
+fn ensure_url_available(
+    zola_root: &Path,
+    path: &str,
+    content: &[u8],
+    excluded_path: Option<&str>,
+) -> Result<(), DraftError> {
+    if let Some(conflict) = site::find_url_collision(zola_root, path, content, excluded_path)
+        .map_err(|_| {
+            draft_error(
+                "url_check_failed",
+                "Blogger could not safely check the draft URL for collisions.",
+            )
+        })?
+    {
+        return Err(DraftError {
+            error: "url_collision",
+            message: format!(
+                "The effective URL {} is already used by {}. Choose another slug or front matter path.",
+                conflict.url, conflict.path
+            ),
+            current_revision: None,
+            replacement_index: None,
+            match_count: None,
+        });
+    }
+    Ok(())
+}
+
+fn collision_error(path: &str) -> DraftError {
+    draft_error(
+        "filename_collision",
+        format!("A post already exists at {path}. Choose another slug."),
+    )
+}
+
+fn entry_exists(path: &Path) -> Result<bool, DraftError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(draft_error(
+            "post_create_failed",
+            "Blogger could not safely inspect the requested draft path.",
+        )),
+    }
+}
+
+fn create_new_file(path: &Path, bytes: &[u8]) -> Result<(), DraftError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                draft_error(
+                    "filename_collision",
+                    "A post appeared at the requested path. Choose another slug.",
+                )
+            } else {
+                draft_error("post_create_failed", "The draft file could not be created.")
+            }
+        })?;
+    if file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(draft_error(
+            "post_create_failed",
+            "The complete draft could not be written, so the partial file was removed.",
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), DraftError> {
+    let temp = unique_temp_path(path);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|_| ())?;
+        file.write_all(bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        fs::rename(&temp, path).map_err(|_| ())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(draft_error(
+            "post_write_failed",
+            "The draft could not be replaced atomically; the original file was left unchanged.",
+        ));
+    }
+    Ok(())
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(
+        ".{name}.blogger-mcp-{}-{nanos}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+fn mutation(message: String, path: &str, content: &str) -> DraftMutation {
+    let metadata = site::metadata_from_bytes(path, content.as_bytes());
+    DraftMutation {
+        message,
+        path: path.to_owned(),
+        title: metadata.title,
+        draft: metadata.draft,
+        url: metadata.url,
+        revision: metadata.revision,
+    }
+}
+
+fn draft_error(error: &'static str, message: impl Into<String>) -> DraftError {
+    DraftError {
+        error,
+        message: message.into(),
+        current_revision: None,
+        replacement_index: None,
+        match_count: None,
+    }
+}
+
+fn replacement_error(
+    error: &'static str,
+    message: impl Into<String>,
+    index: usize,
+    match_count: Option<usize>,
+) -> DraftError {
+    DraftError {
+        error,
+        message: message.into(),
+        current_revision: None,
+        replacement_index: Some(index),
+        match_count,
+    }
 }
 
 struct RankedMatch {
@@ -195,7 +822,12 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{MAX_EXCERPT_CHARS, MAX_SEARCH_RESULTS, load_post, search_posts};
+    use super::{
+        AppendSeparator, DraftStore, ExactReplacement, MAX_EXCERPT_CHARS, MAX_SEARCH_RESULTS,
+        load_post, search_posts, split_document,
+    };
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -235,6 +867,14 @@ mod tests {
 
     fn post(title: &str, date: &str, draft: bool, body: &str) -> String {
         format!("+++\ntitle = {title:?}\ndate = {date:?}\ndraft = {draft}\n+++\n{body}\n")
+    }
+
+    fn store(site: &TempSite) -> DraftStore {
+        DraftStore::new(site.path().to_owned(), Arc::new(Mutex::new(())))
+    }
+
+    fn body(document: &super::PostDocument) -> &str {
+        split_document(&document.content).unwrap().1
     }
 
     #[test]
@@ -375,5 +1015,257 @@ mod tests {
         let matches = search_posts(site.path(), "İSTANBUL", 5).unwrap();
         assert_eq!(matches.len(), 1);
         assert!(matches[0].excerpt.contains("İstanbul"));
+    }
+
+    #[tokio::test]
+    async fn creates_a_forced_draft_with_generated_or_explicit_slug() {
+        let site = TempSite::new();
+        let store = store(&site);
+        let front_matter =
+            "title = \"Voice Notes\"\ndate = 2026-08-12\ndraft = false\ncustom = \"kept\"";
+
+        let created = store
+            .create_draft(front_matter, "First paragraph.", None)
+            .await
+            .unwrap();
+        assert_eq!(created.path, "post/2026/voice-notes.md");
+        assert!(created.draft);
+        assert!(created.message.contains("Created draft"));
+        let loaded = store.load_post(&created.path).unwrap();
+        assert!(loaded.draft);
+        assert_eq!(body(&loaded), "First paragraph.");
+        assert!(
+            split_document(&loaded.content)
+                .unwrap()
+                .0
+                .contains("custom = \"kept\"")
+        );
+
+        let explicit = store
+            .create_draft("title = \"Other title\"", "Body", Some("chosen-name"))
+            .await
+            .unwrap();
+        assert!(explicit.path.ends_with("/chosen-name.md"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_front_matter_and_creation_collisions() {
+        let site = TempSite::new();
+        let store = store(&site);
+
+        let delimiters = store
+            .create_draft("+++\ntitle = \"No\"\n+++", "", None)
+            .await
+            .unwrap_err();
+        assert_eq!(delimiters.error, "invalid_front_matter");
+        assert!(delimiters.message.contains("without"));
+
+        store
+            .create_draft("title = \"First\"\ndate = 2026-08-12", "", Some("same"))
+            .await
+            .unwrap();
+        let collision = store
+            .create_draft("title = \"Second\"\ndate = 2026-08-12", "", Some("same"))
+            .await
+            .unwrap_err();
+        assert_eq!(collision.error, "filename_collision");
+        assert!(collision.message.contains("another slug"));
+
+        let url_collision = store
+            .create_draft(
+                "title = \"URL collision\"\ndate = 2026-08-12\nslug = \"same\"",
+                "",
+                Some("different-file"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(url_collision.error, "url_collision");
+        assert!(url_collision.message.contains("Choose another slug"));
+    }
+
+    #[tokio::test]
+    async fn replaces_only_current_drafts_and_forces_draft_status() {
+        let site = TempSite::new();
+        site.write_post(
+            "post/2026/draft.md",
+            post("Draft", "2026-08-12", true, "Old body").as_bytes(),
+        );
+        site.write_post(
+            "post/2026/published.md",
+            post("Published", "2026-08-12", false, "Public body").as_bytes(),
+        );
+        let store = store(&site);
+        let draft = store.load_post("post/2026/draft.md").unwrap();
+        let replaced = store
+            .replace_draft(
+                &draft.path,
+                &draft.revision,
+                "title = \"Rewritten\"\ndate = 2026-08-12\ndraft = false",
+                "New body",
+            )
+            .await
+            .unwrap();
+        assert!(replaced.draft);
+        assert_eq!(body(&store.load_post(&draft.path).unwrap()), "New body");
+
+        let published = store.load_post("post/2026/published.md").unwrap();
+        let error = store
+            .replace_draft(
+                &published.path,
+                &published.revision,
+                "title = \"Sneaky\"",
+                "Changed",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error, "published_post");
+        assert_eq!(
+            body(&store.load_post(&published.path).unwrap()),
+            "Public body\n"
+        );
+
+        let traversal = store
+            .replace_draft(
+                "post/../outside.md",
+                &draft.revision,
+                "title = \"Outside\"",
+                "Changed",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(traversal.error, "invalid_post_path");
+    }
+
+    #[tokio::test]
+    async fn exact_edits_are_atomic_unique_and_body_only() {
+        let site = TempSite::new();
+        let original = post(
+            "Keep this title",
+            "2026-08-12",
+            true,
+            "Alpha paragraph.\n\nRepeated.\nRepeated.",
+        );
+        site.write_post("post/2026/edit.md", original.as_bytes());
+        let store = store(&site);
+        let loaded = store.load_post("post/2026/edit.md").unwrap();
+        let ambiguous = store
+            .edit_draft(
+                &loaded.path,
+                &loaded.revision,
+                &[
+                    ExactReplacement {
+                        old_text: "Alpha paragraph.".to_owned(),
+                        new_text: "This must not land.".to_owned(),
+                    },
+                    ExactReplacement {
+                        old_text: "Repeated.".to_owned(),
+                        new_text: "Ambiguous.".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(ambiguous.error, "replacement_ambiguous");
+        assert_eq!(ambiguous.replacement_index, Some(1));
+        assert_eq!(ambiguous.match_count, Some(2));
+        assert_eq!(
+            fs::read_to_string(site.path().join("content/post/2026/edit.md")).unwrap(),
+            original
+        );
+
+        let missing = store
+            .edit_draft(
+                &loaded.path,
+                &loaded.revision,
+                &[ExactReplacement {
+                    old_text: "Not present".to_owned(),
+                    new_text: "Nope".to_owned(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.error, "replacement_not_found");
+        assert_eq!(missing.match_count, Some(0));
+
+        let edited = store
+            .edit_draft(
+                &loaded.path,
+                &loaded.revision,
+                &[ExactReplacement {
+                    old_text: "Alpha paragraph.".to_owned(),
+                    new_text: "Revised paragraph.".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let current = store.load_post(&loaded.path).unwrap();
+        assert_eq!(current.title, "Keep this title");
+        assert!(body(&current).contains("Revised paragraph."));
+        assert_ne!(edited.revision, loaded.revision);
+    }
+
+    #[tokio::test]
+    async fn append_respects_separator_and_revisions() {
+        let site = TempSite::new();
+        site.write_post(
+            "post/2026/append.md",
+            post("Append", "2026-08-12", true, "First").as_bytes(),
+        );
+        let store = store(&site);
+        let original = store.load_post("post/2026/append.md").unwrap();
+        let appended = store
+            .append_draft(
+                &original.path,
+                &original.revision,
+                "Second",
+                AppendSeparator::BlankLine,
+            )
+            .await
+            .unwrap();
+        assert!(body(&store.load_post(&original.path).unwrap()).ends_with("First\n\n\nSecond"));
+
+        let conflict = store
+            .append_draft(
+                &original.path,
+                &original.revision,
+                "stale",
+                AppendSeparator::None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.error, "revision_conflict");
+        assert_eq!(
+            conflict.current_revision.as_deref(),
+            Some(appended.revision.as_str())
+        );
+        assert!(conflict.message.contains("get_post"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn draft_writes_reject_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let site = TempSite::new();
+        let outside = site.path().join("outside.md");
+        fs::write(&outside, post("Outside", "2026-08-12", true, "secret")).unwrap();
+        symlink(&outside, site.path().join("content/post/escape-write.md")).unwrap();
+        let store = store(&site);
+
+        let error = store
+            .append_draft(
+                "post/escape-write.md",
+                &crate::site::revision(fs::read(&outside).unwrap().as_slice()),
+                "must not escape",
+                AppendSeparator::None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error, "invalid_post_path");
+        assert!(
+            !fs::read_to_string(outside)
+                .unwrap()
+                .contains("must not escape")
+        );
     }
 }

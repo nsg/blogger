@@ -9,7 +9,7 @@ pub struct AppState {
     pub zola_root: PathBuf,
     pub repository: Repository,
     pub ready: tokio::sync::watch::Receiver<bool>,
-    pub coordinator: tokio::sync::Mutex<()>,
+    pub coordinator: Arc<tokio::sync::Mutex<()>>,
     pub zola: Arc<ZolaChild>,
 }
 
