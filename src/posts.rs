@@ -38,6 +38,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult {
                 "draft": post.draft,
                 "unsorted": post.unsorted,
                 "url": post.url,
+                "revision": post.revision,
             })
         })
         .collect::<Vec<_>>();
@@ -465,7 +466,7 @@ fn directory_entry_exists(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     const AT_FDCWD: c_int = -100;
@@ -503,7 +504,7 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Resul
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::hard_link(source, destination)?;
     if let Err(error) = fs::remove_file(source) {
         let _ = fs::remove_file(destination);

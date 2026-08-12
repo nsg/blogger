@@ -4,6 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -261,7 +262,7 @@ pub async fn commit_push(
     }
     let requested_files = body_strings(&request, "files")?;
 
-    let _guard = state.coordinator.lock().await;
+    let guard = state.coordinator.lock().await;
     refuse_blocked(&state.repository)?;
     let snapshot = repository_status(&state).await.map_err(internal_error)?;
     if snapshot.ahead > 0 {
@@ -317,6 +318,7 @@ pub async fn commit_push(
     }
 
     let commit = head_commit(&state).await.map_err(internal_error)?;
+    drop(guard);
     match push(&state).await {
         Ok(()) => Ok(Json(json!({ "status": "pushed", "commit": commit }))),
         Err(error) => Ok(push_failed(commit, error)),
@@ -324,7 +326,6 @@ pub async fn commit_push(
 }
 
 pub async fn retry_push(State(state): State<Arc<AppState>>) -> ApiResult {
-    let _guard = state.coordinator.lock().await;
     refuse_blocked(&state.repository)?;
     let before = repository_status(&state).await.map_err(internal_error)?;
     if before.ahead == 0 {
@@ -337,6 +338,8 @@ pub async fn retry_push(State(state): State<Arc<AppState>>) -> ApiResult {
     if let Err(error) = fetch(&state).await {
         return Ok(push_failed(original_commit, error));
     }
+
+    let guard = state.coordinator.lock().await;
     refuse_blocked(&state.repository)?;
 
     let snapshot = repository_status(&state).await.map_err(internal_error)?;
@@ -373,6 +376,7 @@ pub async fn retry_push(State(state): State<Arc<AppState>>) -> ApiResult {
     }
 
     let commit = head_commit(&state).await.map_err(internal_error)?;
+    drop(guard);
     match push(&state).await {
         Ok(()) => Ok(Json(json!({ "status": "pushed", "commit": commit }))),
         Err(error) => Ok(push_failed(commit, error)),
@@ -380,16 +384,30 @@ pub async fn retry_push(State(state): State<Arc<AppState>>) -> ApiResult {
 }
 
 pub async fn sync(State(state): State<Arc<AppState>>) -> ApiResult {
-    let _guard = state.coordinator.lock().await;
     refuse_blocked(&state.repository)?;
-    let before = repository_status(&state).await.map_err(internal_error)?;
-    if !before.changes.is_empty() {
+    fetch(&state).await.map_err(internal_error)?;
+    refuse_blocked(&state.repository)?;
+    let snapshot = repository_status(&state).await.map_err(internal_error)?;
+    if !snapshot.changes.is_empty() {
         return Err(sync_conflict(
             "cannot sync while the checkout has uncommitted changes",
         ));
     }
+    if snapshot.ahead > 0 && snapshot.behind > 0 {
+        return Err(sync_conflict(
+            "cannot sync because the local and remote branch histories have diverged",
+        ));
+    }
+    if snapshot.ahead > 0 {
+        return Err(sync_conflict(
+            "cannot sync while the branch has unpushed local commits",
+        ));
+    }
+    if snapshot.behind == 0 {
+        return Ok(Json(json!({ "updated": false })));
+    }
 
-    fetch(&state).await.map_err(internal_error)?;
+    let _guard = state.coordinator.lock().await;
     refuse_blocked(&state.repository)?;
     let snapshot = repository_status(&state).await.map_err(internal_error)?;
     if !snapshot.changes.is_empty() {
@@ -431,14 +449,102 @@ async fn repository_status(state: &AppState) -> Result<StatusSnapshot, String> {
             "--porcelain=v2",
             "--branch",
             "-z",
-            "--untracked-files=all",
-            "--find-renames",
+            "--untracked-files=no",
         ],
         CommandOptions::default(),
-        "read Git status",
+        "read Git branch status",
     )
     .await?;
-    parse_porcelain_v2(&output.stdout)
+    let mut snapshot = parse_porcelain_v2(&output.stdout)?;
+    snapshot.changes = working_tree_changes(&state.repository, &state.config).await?;
+    Ok(snapshot)
+}
+
+async fn working_tree_changes(
+    repository: &Repository,
+    config: &Config,
+) -> Result<Vec<Change>, String> {
+    let index_path = temporary_index_path();
+    let result: Result<Vec<Change>, String> = async {
+        required_output(
+            run_git_with_index(
+                &repository.root,
+                config,
+                &["read-tree", "HEAD"],
+                None,
+                &index_path,
+            )
+            .await?,
+            "seed temporary Git index",
+        )?;
+        required_output(
+            run_git_with_index(&repository.root, config, &["add", "-A"], None, &index_path).await?,
+            "stage checkout changes in temporary Git index",
+        )?;
+        let output = required_output(
+            run_git_with_index(
+                &repository.root,
+                config,
+                &[
+                    "diff",
+                    "--cached",
+                    "--name-status",
+                    "--find-renames",
+                    "-z",
+                    "HEAD",
+                ],
+                None,
+                &index_path,
+            )
+            .await?,
+            "read changed Git paths from temporary index",
+        )?;
+        parse_name_status(&output.stdout)
+    }
+    .await;
+
+    let cleanup = remove_temporary_index(&index_path);
+    match (result, cleanup) {
+        (Ok(changes), Ok(())) => Ok(changes),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(format!("{error}; {cleanup_error}")),
+    }
+}
+
+fn temporary_index_path() -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "blogger-git-index-{}-{sequence}",
+            std::process::id()
+        ));
+        if !path.exists() && !temporary_index_lock_path(&path).exists() {
+            return path;
+        }
+    }
+}
+
+fn temporary_index_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn remove_temporary_index(path: &Path) -> Result<(), String> {
+    for candidate in [path.to_owned(), temporary_index_lock_path(path)] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove temporary Git index {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn fetch(state: &AppState) -> Result<(), String> {
@@ -953,12 +1059,36 @@ async fn run_git(
     args: &[&str],
     options: Option<CommandOptions>,
 ) -> Result<GitOutput, String> {
+    run_git_inner(directory, config, args, options, None).await
+}
+
+async fn run_git_with_index(
+    directory: &Path,
+    config: &Config,
+    args: &[&str],
+    options: Option<CommandOptions>,
+    index_file: &Path,
+) -> Result<GitOutput, String> {
+    run_git_inner(directory, config, args, options, Some(index_file)).await
+}
+
+async fn run_git_inner(
+    directory: &Path,
+    config: &Config,
+    args: &[&str],
+    options: Option<CommandOptions>,
+    index_file: Option<&Path>,
+) -> Result<GitOutput, String> {
     let options = options.unwrap_or_default();
     let mut command = Command::new("git");
     command
         .args(args)
         .current_dir(directory)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
     if options.identity {
         command
             .env("GIT_AUTHOR_NAME", &config.git_name)
@@ -973,9 +1103,20 @@ async fn run_git(
             .env("GIT_ASKPASS", executable)
             .env("BLOGGER_ASKPASS_MODE", "1");
     }
-    let output = command
-        .output()
+    let timeout_duration = if options.network {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    };
+    let output = tokio::time::timeout(timeout_duration, command.output())
         .await
+        .map_err(|_| {
+            format!(
+                "Git {} command timed out after {} seconds",
+                if options.network { "network" } else { "local" },
+                timeout_duration.as_secs()
+            )
+        })?
         .map_err(|error| format!("failed to run Git: {error}"))?;
     Ok(GitOutput {
         status: output.status,
@@ -1282,6 +1423,16 @@ mod tests {
         assert_eq!(repository.upstream, "origin/master");
         assert_eq!(repository.post_prefix, "site/content/post/");
         assert_eq!(repository.image_prefix, "site/static/images/");
+
+        fs::rename(
+            temporary.root.join("tracked.txt"),
+            temporary.root.join("renamed.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            working_tree_changes(&repository, &config).await.unwrap(),
+            vec![renamed("tracked.txt", "renamed.txt")]
+        );
     }
 
     struct TemporaryRepository {

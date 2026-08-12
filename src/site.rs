@@ -28,6 +28,7 @@ pub struct PostMetadata {
     pub draft: bool,
     pub unsorted: bool,
     pub url: String,
+    pub revision: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +172,7 @@ pub fn metadata_from_bytes(content_relative_path: &str, content: &[u8]) -> PostM
         draft: front_matter.draft,
         unsorted: front_matter.unsorted,
         url: effective_url(content_relative_path, &front_matter),
+        revision: revision(content),
     }
 }
 
@@ -783,5 +785,9 @@ mod tests {
         assert!(posts[0].unsorted);
         assert_eq!(posts[1].path, "post/2026/valid.md");
         assert!(!posts[1].unsorted);
+        assert_eq!(
+            posts[1].revision,
+            revision(b"+++\ntitle = \"Valid\"\ndate = 2026-08-12\n+++\n")
+        );
     }
 }

@@ -753,8 +753,11 @@ export function initMonaco(): Promise<PostDocumentController> {
       applying: boolean;
       deleted: boolean;
       conflict: boolean;
+      conflictMessage: string;
       blocked: boolean;
+      blockedError: ApiError | null;
       failed: boolean;
+      mutationCounter: number;
       saveTimer: ReturnType<typeof setTimeout> | null;
       retryTimer: ReturnType<typeof setTimeout> | null;
       retryDelay: number;
@@ -796,6 +799,12 @@ export function initMonaco(): Promise<PostDocumentController> {
 
     function showConflict(doc: OpenDocument, message = "Your unsaved text is preserved. Choose which version to keep.") {
       doc.conflict = true;
+      doc.conflictMessage = message;
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+      if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      doc.retryTimer = null;
+      if (doc !== activeDocument) return;
       banner.hidden = false;
       banner.className = "editor-banner conflict";
       bannerTitle.textContent = "This post changed on disk";
@@ -804,9 +813,11 @@ export function initMonaco(): Promise<PostDocumentController> {
       bannerButton("Reload from disk", () => void reloadFromDisk(doc));
       bannerButton("Overwrite", () => {
         doc.conflict = false;
+        doc.conflictMessage = "";
         clearBanner();
         void saveDocument(doc, "overwrite");
       });
+      setSaveState("unsaved");
     }
 
     function oldSlug(path: string) {
@@ -816,7 +827,9 @@ export function initMonaco(): Promise<PostDocumentController> {
     function showDeleted(doc: OpenDocument) {
       doc.deleted = true;
       if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
       if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      doc.retryTimer = null;
       if (doc !== activeDocument) return;
       banner.hidden = false;
       banner.className = "editor-banner deleted";
@@ -834,6 +847,12 @@ export function initMonaco(): Promise<PostDocumentController> {
 
     function showCollision(doc: OpenDocument, error: ApiError) {
       doc.blocked = true;
+      doc.blockedError = error;
+      if (doc.saveTimer) clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+      if (doc.retryTimer) clearTimeout(doc.retryTimer);
+      doc.retryTimer = null;
+      if (doc !== activeDocument) return;
       banner.hidden = false;
       banner.className = "editor-banner collision";
       bannerTitle.textContent = error.body.error;
@@ -846,10 +865,13 @@ export function initMonaco(): Promise<PostDocumentController> {
       if (doc === activeDocument) updateWordCount();
       if (!doc.applying) {
         doc.dirty = doc.model.getValue() !== doc.lastSaved;
-        if (doc.blocked) doc.blocked = false;
+        if (doc.blocked) {
+          doc.blocked = false;
+          doc.blockedError = null;
+        }
         if (doc === activeDocument) {
           if (doc.deleted) showDeleted(doc);
-          else if (doc.conflict) showConflict(doc);
+          else if (doc.conflict) showConflict(doc, doc.conflictMessage);
           else clearBanner();
           setSaveState(doc.failed ? "failed" : doc.dirty ? "unsaved" : "saved");
         }
@@ -926,11 +948,11 @@ export function initMonaco(): Promise<PostDocumentController> {
         } catch (error) {
           if (error instanceof ApiError && error.status === 409) {
             if (error.body.deleted) showDeleted(doc);
-            else if (doc === activeDocument) showConflict(doc);
+            else showConflict(doc);
             return false;
           }
           if (error instanceof ApiError && error.status === 422) {
-            if (doc === activeDocument) showCollision(doc, error);
+            showCollision(doc, error);
             return false;
           }
           if (doc === activeDocument) setSaveState("failed");
@@ -940,6 +962,7 @@ export function initMonaco(): Promise<PostDocumentController> {
         } finally {
           doc.saving = false;
           doc.savePromise = null;
+          doc.mutationCounter += 1;
         }
       })();
       doc.savePromise = pending;
@@ -956,20 +979,24 @@ export function initMonaco(): Promise<PostDocumentController> {
       return !doc.dirty;
     }
 
-    async function reloadFromDisk(doc: OpenDocument) {
+    async function reloadFromDisk(doc: OpenDocument, supplied?: PostResponse) {
       try {
-        const loaded = await api<PostResponse>(`/api/post?path=${encodeURIComponent(doc.path)}`);
+        const loaded = supplied ?? await api<PostResponse>(`/api/post?path=${encodeURIComponent(doc.path)}`);
         doc.applying = true;
         const view = doc === activeDocument ? editor.saveViewState() : doc.viewState;
         doc.model.setValue(loaded.content);
         doc.applying = false;
         doc.revision = loaded.revision;
+        doc.mutationCounter += 1;
         doc.url = loaded.url;
         doc.title = loaded.title;
         doc.lastSaved = loaded.content;
         doc.dirty = false;
         doc.conflict = false;
+        doc.conflictMessage = "";
         doc.deleted = false;
+        doc.blocked = false;
+        doc.blockedError = null;
         doc.failed = false;
         if (doc.retryTimer) clearTimeout(doc.retryTimer);
         doc.retryTimer = null;
@@ -1068,8 +1095,10 @@ export function initMonaco(): Promise<PostDocumentController> {
           activeDocument.applying = false;
           activeDocument.dirty = false;
           activeDocument.conflict = false;
+          activeDocument.conflictMessage = "";
           activeDocument.deleted = false;
           activeDocument.blocked = false;
+          activeDocument.blockedError = null;
           activeDocument.failed = false;
           if (activeDocument.retryTimer) clearTimeout(activeDocument.retryTimer);
           activeDocument.retryTimer = null;
@@ -1077,35 +1106,42 @@ export function initMonaco(): Promise<PostDocumentController> {
       }
       let doc = documents.get(path);
       try {
-        const loaded = supplied ?? await api<PostResponse>(`/api/post?path=${encodeURIComponent(path)}`);
-        if (!doc) {
-          const postModel = monaco.editor.createModel(loaded.content, "markdown", monaco.Uri.parse(`inmemory://post/${loaded.path}`));
-          doc = {
-            path: loaded.path, model: postModel, revision: loaded.revision, url: loaded.url,
-            title: loaded.title, lastSaved: loaded.content, dirty: false, saving: false,
-            applying: false, deleted: false, conflict: false, blocked: false,
-            failed: false,
-            saveTimer: null, retryTimer: null, retryDelay: 1500, savePromise: null, viewState: null,
-            decorations: [],
-          };
-          documents.set(path, doc);
-          postModel.onDidChangeContent(() => handleModelChange(doc!));
-        } else if (!doc.dirty && doc.revision !== loaded.revision) {
-          doc.applying = true;
-          doc.model.setValue(loaded.content);
-          doc.applying = false;
-          doc.revision = loaded.revision;
-          doc.lastSaved = loaded.content;
-          doc.url = loaded.url;
-          doc.title = loaded.title;
-          doc.conflict = false;
-          doc.deleted = false;
-          doc.blocked = false;
-        }
-        if (doc && !doc.dirty) {
-          doc.conflict = false;
-          doc.deleted = false;
-          doc.blocked = false;
+        if (!doc?.deleted) {
+          const loaded = supplied ?? await api<PostResponse>(`/api/post?path=${encodeURIComponent(path)}`);
+          if (!doc) {
+            const postModel = monaco.editor.createModel(loaded.content, "markdown", monaco.Uri.parse(`inmemory://post/${loaded.path}`));
+            doc = {
+              path: loaded.path, model: postModel, revision: loaded.revision, url: loaded.url,
+              title: loaded.title, lastSaved: loaded.content, dirty: false, saving: false,
+              applying: false, deleted: false, conflict: false, blocked: false,
+              conflictMessage: "", blockedError: null, failed: false, mutationCounter: 0,
+              saveTimer: null, retryTimer: null, retryDelay: 1500, savePromise: null, viewState: null,
+              decorations: [],
+            };
+            documents.set(path, doc);
+            postModel.onDidChangeContent(() => handleModelChange(doc!));
+          } else if (!doc.dirty && doc.revision !== loaded.revision) {
+            doc.applying = true;
+            doc.model.setValue(loaded.content);
+            doc.applying = false;
+            doc.revision = loaded.revision;
+            doc.mutationCounter += 1;
+            doc.lastSaved = loaded.content;
+            doc.url = loaded.url;
+            doc.title = loaded.title;
+            doc.conflict = false;
+            doc.conflictMessage = "";
+            doc.deleted = false;
+            doc.blocked = false;
+            doc.blockedError = null;
+          }
+          if (doc && !doc.dirty) {
+            doc.conflict = false;
+            doc.conflictMessage = "";
+            doc.deleted = false;
+            doc.blocked = false;
+            doc.blockedError = null;
+          }
         }
       } catch (error) {
         if (error instanceof ApiError && error.status === 404) {
@@ -1129,6 +1165,9 @@ export function initMonaco(): Promise<PostDocumentController> {
       localStorage.setItem("blogger-selected-post", doc!.path);
       setSaveState(doc!.failed ? "failed" : doc!.dirty ? "unsaved" : "saved");
       clearBanner();
+      if (doc!.deleted) showDeleted(doc!);
+      else if (doc!.conflict) showConflict(doc!, doc!.conflictMessage);
+      else if (doc!.blocked && doc!.blockedError) showCollision(doc!, doc!.blockedError);
       S.paragraphMap.clear();
       S.nopParagraphs.clear();
       S.setCurrentParagraphId(null);
@@ -1166,12 +1205,22 @@ export function initMonaco(): Promise<PostDocumentController> {
     async function checkActiveRevision() {
       const doc = activeDocument;
       if (!doc || doc.deleted || doc.saving) return;
+      const mutationCounter = doc.mutationCounter;
+      const revision = doc.revision;
+      const responseIsCurrent = () => doc === activeDocument
+        && doc.mutationCounter === mutationCounter
+        && doc.revision === revision
+        && !doc.saving
+        && doc.saveTimer === null
+        && doc.retryTimer === null;
       try {
         const loaded = await api<PostResponse>(`/api/post?path=${encodeURIComponent(doc.path)}`);
-        if (loaded.revision === doc.revision) return;
+        if (!responseIsCurrent()) return;
+        if (loaded.revision === revision) return;
         if (doc.dirty) showConflict(doc, "The disk version changed while you were editing. Your text has not been replaced.");
-        else await reloadFromDisk(doc);
+        else await reloadFromDisk(doc, loaded);
       } catch (error) {
+        if (!responseIsCurrent()) return;
         if (error instanceof ApiError && error.status === 404) {
           if (doc.dirty) showDeleted(doc);
           else clearSelection(true);
@@ -1501,11 +1550,7 @@ export function initMonaco(): Promise<PostDocumentController> {
         return flushDocument(doc);
       },
       isDirty(path) { return documents.get(path)?.dirty ?? false; },
-      async getRevision(path) {
-        const doc = documents.get(path);
-        if (doc) return doc.revision;
-        return (await api<PostResponse>(`/api/post?path=${encodeURIComponent(path)}`)).revision;
-      },
+      getKnownRevision(path) { return documents.get(path)?.revision ?? null; },
       getActivePath() { return activeDocument?.path ?? null; },
       renameDocument,
       disposeDocument,

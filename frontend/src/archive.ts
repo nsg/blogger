@@ -17,6 +17,20 @@ function localDateTimeValue(date = new Date()) {
   return local.toISOString().slice(0, 16);
 }
 
+function localRfc3339(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?$/);
+  if (!match) throw new Error("Enter a valid date and time.");
+  const [, year, month, day, hour, minute, seconds = "00", fraction = ""] = match;
+  const localDate = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(seconds));
+  if (!Number.isFinite(localDate.getTime())) throw new Error("Enter a valid date and time.");
+  const offsetMinutes = -localDate.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const offset = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(offset / 60)).padStart(2, "0");
+  const offsetRemainder = String(offset % 60).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}:${seconds}${fraction}${sign}${offsetHours}:${offsetRemainder}`;
+}
+
 function filename(path: string) {
   return (path.split("/").pop() || path).replace(/\.md$/, "");
 }
@@ -50,7 +64,8 @@ export function initArchive(documents: PostDocumentController, git: GitUiControl
   let selectedPath: string | null = documents.getActivePath();
   const collapsedGroups = new Set<string>();
 
-  const storedWidth = Number(localStorage.getItem(WIDTH_KEY));
+  const storedWidthValue = localStorage.getItem(WIDTH_KEY);
+  const storedWidth = storedWidthValue?.trim() ? Number(storedWidthValue) : 260;
   panel.style.setProperty("--archive-width", `${Number.isFinite(storedWidth) ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, storedWidth)) : 260}px`);
   panel.classList.remove("open");
 
@@ -221,6 +236,12 @@ export function initArchive(documents: PostDocumentController, git: GitUiControl
     collapsedGroups.delete(`${yearKey}:month:${date.month}`);
   }
 
+  function revisionFor(post: ArchivePost) {
+    return documents.getKnownRevision(post.path)
+      ?? posts.find((candidate) => candidate.path === post.path)?.revision
+      ?? post.revision;
+  }
+
   async function refresh() {
     if (loading) return;
     loading = true;
@@ -279,7 +300,7 @@ export function initArchive(documents: PostDocumentController, git: GitUiControl
       try {
         const result = await api<CreatePostResponse>("/api/post/create", jsonRequest("POST", {
           title: title.value.trim(), slug: slug.value.trim(),
-          date: new Date(date.value).toISOString(), draft: draft.checked,
+          date: localRfc3339(date.value), draft: draft.checked,
         }));
         modal.close();
         const loaded: PostResponse = { ...result, title: title.value.trim() };
@@ -328,7 +349,7 @@ export function initArchive(documents: PostDocumentController, git: GitUiControl
       rename.disabled = true;
       try {
         if (!(await documents.flush(post.path))) throw new Error("Resolve unsaved changes before renaming.");
-        const revision = await documents.getRevision(post.path);
+        const revision = revisionFor(post);
         const result = await api<RenamePostResponse>("/api/post/rename", jsonRequest("POST", {
           path: post.path, new_filename: input.value.trim(), base_revision: revision,
         }));
@@ -365,7 +386,7 @@ export function initArchive(documents: PostDocumentController, git: GitUiControl
     remove.addEventListener("click", async () => {
       remove.disabled = true;
       try {
-        const revision = await documents.getRevision(post.path);
+        const revision = revisionFor(post);
         await api<Record<string, never>>("/api/post/delete", jsonRequest("POST", { path: post.path, base_revision: revision }));
         modal.close();
         posts = posts.filter((item) => item.path !== post.path);

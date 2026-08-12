@@ -12,8 +12,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::state::AppState;
 use crate::tools::{exec_tool, web_tools};
+use crate::{posts, state::AppState};
 
 const MAX_TOOL_ROUNDS: usize = 6;
 const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
@@ -521,53 +521,39 @@ pub async fn upload_image(
 }
 
 fn ensure_images_root(site_root: &FsPath) -> Result<PathBuf, ApiErr> {
-    let images_root = site_root.join("static/images");
     let canonical_site_root = site_root.canonicalize().map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to resolve site directory: {error}") })),
         )
     })?;
-    let mut existing_parent = images_root.as_path();
-    while !existing_parent.exists() {
-        existing_parent = existing_parent.parent().ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "image directory has no existing parent" })),
-            )
-        })?;
-    }
-    let canonical_existing_parent = existing_parent.canonicalize().map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to resolve image directory: {error}") })),
-        )
-    })?;
-    if !canonical_existing_parent.starts_with(&canonical_site_root) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "image directory escapes the Zola root" })),
-        ));
-    }
+    let images_root = canonical_site_root.join("static/images");
     std::fs::create_dir_all(&images_root).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to create image directory: {error}") })),
         )
     })?;
-    let images_root = images_root.canonicalize().map_err(|error| {
+    let canonical_images_root = images_root.canonicalize().map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to resolve image directory: {error}") })),
         )
     })?;
-    if !images_root.starts_with(canonical_site_root) {
+    if canonical_images_root != images_root {
         return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "image directory escapes the Zola root" })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!(
+                    "image directory misconfiguration: {} resolves to {}, expected {}",
+                    images_root.display(),
+                    canonical_images_root.display(),
+                    images_root.display()
+                )
+            })),
         ));
     }
-    Ok(images_root)
+    Ok(canonical_images_root)
 }
 
 fn confined_image_parent(images_root: &FsPath, parent: &FsPath) -> Result<PathBuf, ApiErr> {
@@ -679,7 +665,16 @@ pub async fn rename_image(
 
     let _guard = state.coordinator.lock().await;
     let images_root = ensure_images_root(&state.zola_root)?;
-    let src = resolve_image_path(&images_root, old_path)?;
+    let new_md_path = rename_image_file(&images_root, old_path, &sanitized)?;
+    Ok(Json(json!({ "path": new_md_path })))
+}
+
+fn rename_image_file(
+    images_root: &FsPath,
+    old_path: &str,
+    sanitized: &str,
+) -> Result<String, ApiErr> {
+    let src = resolve_image_path(images_root, old_path)?;
     match std::fs::symlink_metadata(&src) {
         Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -703,21 +698,32 @@ pub async fn rename_image(
     }
 
     let dir = src.parent().unwrap();
-    let dest = dir.join(&sanitized);
-    std::fs::rename(&src, &dest).map_err(|e| {
+    let dest = dir.join(sanitized);
+    if src != dest {
+        posts::rename_without_overwrite(&src, &dest).map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "image destination already exists" })),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("rename failed: {error}") })),
+            ),
+        })?;
+    }
+
+    let relative = dest.strip_prefix(images_root).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("rename failed: {e}") })),
+            Json(json!({ "error": "renamed image is outside the image directory" })),
         )
     })?;
-
-    let parent_name = FsPath::new(old_path)
-        .parent()
-        .and_then(FsPath::file_name)
-        .unwrap_or_default()
-        .to_string_lossy();
-    let new_md_path = format!("/images/{parent_name}/{sanitized}");
-    Ok(Json(json!({ "path": new_md_path })))
+    let relative = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(format!("/images/{relative}"))
 }
 
 pub async fn delete_image(
@@ -764,7 +770,88 @@ pub async fn delete_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_preview_css, rewrite_preview_html};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{ensure_images_root, rename_image_file, rewrite_preview_css, rewrite_preview_html};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "blogger-handlers-test-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn image_rename_never_overwrites_and_preserves_nested_markdown_path() {
+        let tree = TempTree::new();
+        let images_root = tree.path().join("static/images");
+        fs::create_dir_all(images_root.join("2026/trip")).unwrap();
+        let source = images_root.join("2026/trip/photo.png");
+        let destination = images_root.join("2026/trip/renamed.png");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+
+        let error = rename_image_file(&images_root, "/images/2026/trip/photo.png", "renamed.png")
+            .unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "destination");
+
+        fs::remove_file(&destination).unwrap();
+        let path =
+            rename_image_file(&images_root, "/images/2026/trip/photo.png", "renamed.png").unwrap();
+        assert_eq!(path, "/images/2026/trip/renamed.png");
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_images_root_as_internal_misconfiguration() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        fs::create_dir_all(tree.path().join("static")).unwrap();
+        fs::create_dir_all(tree.path().join("content")).unwrap();
+        symlink("../content", tree.path().join("static/images")).unwrap();
+
+        let error = ensure_images_root(tree.path()).unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error.1.0["error"]
+                .as_str()
+                .unwrap()
+                .contains("misconfiguration")
+        );
+    }
 
     #[test]
     fn strips_livereload_script_but_keeps_other_scripts() {

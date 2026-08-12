@@ -54,6 +54,7 @@ export interface ArchivePost {
   draft: boolean;
   unsorted: boolean;
   url: string;
+  revision: string;
 }
 
 export interface PostsResponse { posts: ArchivePost[]; }
@@ -110,7 +111,7 @@ export interface PostDocumentController {
   openPost(path: string, supplied?: PostResponse): Promise<boolean>;
   flush(path?: string): Promise<boolean>;
   isDirty(path: string): boolean;
-  getRevision(path: string): Promise<string>;
+  getKnownRevision(path: string): string | null;
   getActivePath(): string | null;
   renameDocument(oldPath: string, newPath: string, url: string): void;
   disposeDocument(path: string): void;
