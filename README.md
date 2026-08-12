@@ -1,153 +1,134 @@
 <div align="center">
   <h1>Blogger</h1>
-  <p>AI-powered writing environment for Zola blogs.</p>
+  <p>A self-hosted writing environment for Zola blogs.</p>
 </div>
 
 ---
 
 ## About
 
-Blogger is a local writing tool that combines a Monaco editor, an AI assistant, and a live Zola preview in a three-pane layout. Point it at a markdown file in your Zola blog and start writing — the AI reviews your paragraphs, suggests edits, and can search the web to verify facts.
+Blogger is a self-hosted writing environment for a Zola blog. It combines a Monaco editor, an AI writing assistant, dictation, and a live preview in one browser interface.
+
+Run Blogger as a container in front of an existing Git checkout of the blog. Blogger edits that writable checkout and starts Zola for previewing; the deployment remains responsible for providing and backing up the checkout.
 
 ## Features
 
-- **Monaco editor** with Zola front matter syntax highlighting and word count
-- **AI writing assistant** with paragraph-level feedback and "Apply fix" buttons
-- **Voice dictation** — record from the editor and insert transcribed text at the cursor
-- **Live Zola preview** rendered in a side pane via Podman
-- **Web search and fetch** — the AI can look things up while helping you write
-- **Auto-save** with atomic writes so Zola never sees a truncated file
-- **Auto-create posts** — pass a non-existing path and Blogger creates the file with front matter and any missing `_index.md` sections
-- **Resizable three-pane layout** — reference browser, editor, and assistant
+- Browse and manage posts from an archive panel.
+- Edit multiple posts with automatic saves and external-change conflict detection.
+- Create and preview draft posts.
+- Review writing with an AI assistant and insert speech-to-text dictation.
+- Preview the site through an authenticated live Zola view.
+- Commit all checkout changes and push them to GitHub manually.
+- Protect the interface with a single-password login.
 
 ## Quick Start
 
-```bash
-# Install build dependency (Debian/Ubuntu)
-sudo apt install libdbus-1-dev
-
-# Clone and install
-git clone <repo-url> && cd blogger
-./install.sh
-
-# Store your Ollama API key in the system keyring
-blogger set-key
-
-# Store your OpenAI STT API key for voice dictation
-blogger set-stt-key
-
-# Open an existing post
-blogger ~/blog/site/content/posts/my-post.md
-
-# Or create a new one (auto-generates front matter)
-blogger ~/blog/site/content/posts/new-post.md
-```
-
-Open `http://localhost:3000` in your browser.
-
-To use Blogger from another device on your local network, start it normally and
-copy the short PIN printed in the terminal:
+Run these commands from the blog checkout. Ensure the checkout is writable by UID 1000, which the container uses for its `blogger` user.
 
 ```bash
-blogger ~/blog/site/content/posts/my-post.md
+export OLLAMA_API_KEY='replace-with-ollama-key'
+export OPENAI_API_KEY='replace-with-openai-key'
+export BLOGGER_PASSWORD='replace-with-login-password'
+export BLOGGER_SESSION_SECRET="$(openssl rand -hex 32)"
+export GITHUB_TOKEN='replace-with-github-token'
+export BLOGGER_GIT_NAME='Your Name'
+export BLOGGER_GIT_EMAIL='you@example.com'
+
+docker run --rm \
+  --publish 3000:3000 \
+  --mount type=bind,src="$PWD",dst=/data \
+  --workdir /data \
+  --env OLLAMA_API_KEY \
+  --env OPENAI_API_KEY \
+  --env BLOGGER_PASSWORD \
+  --env BLOGGER_SESSION_SECRET \
+  --env GITHUB_TOKEN \
+  --env BLOGGER_GIT_NAME \
+  --env BLOGGER_GIT_EMAIL \
+  ghcr.io/nsg/blogger
 ```
 
-Then visit the machine's LAN address:
+Open `http://localhost:3000`. Put Blogger behind an HTTPS reverse proxy when exposing it outside the host.
 
-```text
-http://<your-lan-ip>:3000
+### Running from source
+
+Install Node.js 22, the stable Rust toolchain, and Zola, and ensure `zola` is on `PATH`. Build the embedded frontend from the Blogger source checkout:
+
+```bash
+cd /path/to/blogger/frontend
+npm ci
+npm run build
 ```
 
-Localhost access does not require a PIN. Remote browsers must enter the PIN
-within 120 seconds; after that, Blogger stores a persistent HTTP-only session
-cookie. The server stores the matching session token in the system keyring, so
-authorized browsers remain authorized across Blogger restarts. The Zola preview
-is exposed on `http://<your-lan-ip>:1111`.
+Export the seven variables shown above, then run Blogger from the blog checkout. Using `--manifest-path` keeps the blog checkout as the process working directory, so no search-root argument is needed.
 
-## Requirements
-
-- **Rust** toolchain (for building)
-- **Podman** — runs Zola in a container for live preview
-- **D-Bus secret service** (GNOME Keyring, KDE Wallet, etc.) — stores the API key
-- **Ollama API key** — powers the AI assistant
+```bash
+cd /path/to/blog/checkout
+cargo run --locked --manifest-path /path/to/blogger/Cargo.toml
+```
 
 ## Configuration
 
-### API Keys
+All environment variables are required and must be non-empty.
 
-Store your Ollama API key securely in the system keyring:
+| Variable | Description |
+| --- | --- |
+| `OLLAMA_API_KEY` | Authenticates requests from the AI writing assistant to Ollama. |
+| `OPENAI_API_KEY` | Authenticates speech-to-text requests for dictation. |
+| `BLOGGER_PASSWORD` | Sets the plaintext password for the single-user login. |
+| `BLOGGER_SESSION_SECRET` | Signs login sessions; provide exactly 64 hexadecimal characters representing 32 random bytes. |
+| `GITHUB_TOKEN` | Authenticates HTTPS Git operations against the configured GitHub origin. |
+| `BLOGGER_GIT_NAME` | Sets the author and committer name for commits Blogger creates. |
+| `BLOGGER_GIT_EMAIL` | Sets the author and committer email for commits Blogger creates. |
 
-```bash
-blogger set-key
-```
-
-The key is looked up in this order:
-
-1. `OLLAMA_API_KEY` environment variable (or `.env` file)
-2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
-
-Voice dictation uses OpenAI speech-to-text. Store that key separately:
-
-```bash
-blogger set-stt-key
-```
-
-The STT key is looked up in this order:
-
-1. `OPENAI_API_KEY` environment variable (or `.env` file)
-2. System keyring (GNOME Keyring, KDE Wallet, macOS Keychain, etc.)
-
-### Local Network Access
-
-Blogger binds the web UI to `0.0.0.0:3000`, and the Zola preview container is
-published on `0.0.0.0:1111`. Use your machine's LAN address from another
-device:
+Generate a session secret outside Blogger and keep it stable across restarts:
 
 ```bash
-hostname -I
+openssl rand -hex 32
 ```
 
-Localhost requests are allowed without authentication. Requests from other
-devices require either:
+Rotating `BLOGGER_SESSION_SECRET` invalidates existing login sessions.
 
-- a valid `blogger_session` cookie, set automatically after entering the startup
-  PIN in the browser and retained across Blogger restarts
-- an `Authorization: Bearer <session-token>` header, for scripted access using
-  the issued session token
+### GitHub token
 
-The startup PIN is printed to the terminal and is valid for 120 seconds. It is
-only needed for new remote browsers or after the persistent session expires.
-`/api/health` remains unauthenticated for health checks.
+Create a fine-grained GitHub personal access token. Restrict its repository access to the blog repository and grant only the repository `Contents` permission with read and write access. Supply the token as `GITHUB_TOKEN`; keep the checkout's `origin` URL as ordinary HTTPS without embedded credentials.
 
-When Blogger is behind an HTTPS reverse proxy, configure the proxy to send
-`X-Forwarded-Proto: https`. Blogger uses that header to mark the session cookie
-as `Secure`.
+### Repository requirements
+
+- Provide a writable, non-bare Git checkout including its `.git` directory. The discovered Zola site must be inside that checkout.
+- Check out a normal branch and configure it to track the matching `origin/<branch>` upstream.
+- Configure `origin` with an HTTPS URL.
+- Provide a Zola site with `content/post`. Set `[slugify].paths = "on"` in `config.toml`, or omit that setting to use Zola's supported default.
+- Allow Blogger to write `content/post` and `static/images`.
+
+The deployment must populate the checkout before Blogger starts; Blogger never clones it. Run exactly one Blogger replica against a checkout. Multiple processes or replicas sharing one working tree are unsupported.
 
 ## Usage
 
-```
-blogger [PATH]
-blogger set-key
-blogger set-stt-key
+```text
+blogger [SEARCH_ROOT]
 ```
 
-**PATH** can be:
+`SEARCH_ROOT` must be a directory. Blogger recursively scans it and uses the first `config.toml` it finds as the Zola site root. If omitted, `SEARCH_ROOT` defaults to the current working directory. Startup fails if the site, writable content paths, required environment, Git repository contract, or Zola process is unavailable.
 
-| Input | Behavior |
-|---|---|
-| Existing `.md` file | Opens it in the editor, starts Zola preview |
-| Non-existing `.md` file | Creates it with front matter, then opens it |
-| Directory | Treats it as the blog root, starts Zola preview |
-| *(omitted)* | Starts the editor with default content, no preview |
+### Ports and probes
 
-The tool detects your Zola site by walking up from the file looking for a `site/` directory or `config.toml`.
+| Port | Access | Service |
+| --- | --- | --- |
+| 3000 | Exposed | Blogger web UI and authenticated preview proxy. |
+| 1111 | Internal on `127.0.0.1` | Zola live preview. Do not expose this port. |
 
-### Ports
+Use `GET /api/health` as the liveness probe. It reports that the Blogger process is serving requests. Use `GET /api/ready` as the readiness probe; it succeeds after the private Zola preview responds. Both endpoints are unauthenticated.
 
-| Port | Service |
-|---|---|
-| 3000 | Blogger web UI |
-| 1111 | Zola preview (Podman container) |
+### Git publication
+
+Automatic saves only update the checkout. **Commit and push** fetches the upstream, checks for overlapping local and remote paths, shows all checkout changes, creates one commit with the confirmed subject, rebases remote-only changes when safe, and pushes the checked-out branch. If the push fails after the commit, use **Retry push**; Blogger does not create a duplicate commit.
+
+**Sync from GitHub** fetches and fast-forwards the branch only when the working tree is clean, no local commits are unpushed, and the histories have not diverged. Blogger never syncs automatically.
+
+### Drafts
+
+Blogger starts Zola with `--drafts`, so draft posts appear in the archive and preview. Publish a draft by editing its TOML front matter in Monaco and removing `draft = true` or changing it to `draft = false`.
 
 ## License
 

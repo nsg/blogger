@@ -1,0 +1,11 @@
+.git/
+.github/
+.claude-sandbox/
+.playwright-mcp/
+target/
+frontend/node_modules/
+.env
+.env.*
+Dockerfile*
+README.md
+install.sh

@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cargo build --release
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir"
 
-mkdir -p ~/bin
-cp target/release/blogger ~/bin/blogger
+(
+    cd frontend
+    npm ci
+    npm run build
+)
 
-echo "installed blogger to ~/bin/blogger"
+cargo build --release --locked
+
+install -d "$HOME/bin"
+install -m 0755 target/release/blogger "$HOME/bin/blogger"
+
+echo "installed blogger to $HOME/bin/blogger"
