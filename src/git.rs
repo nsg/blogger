@@ -1410,6 +1410,7 @@ mod tests {
 
         let config = Config {
             ollama_key: "ollama".to_owned(),
+            ollama_model: "qwen3.5:397b".to_owned(),
             stt_api_key: "openai".to_owned(),
             password: "password".to_owned(),
             session_secret: [0; 32],

@@ -68,7 +68,7 @@ export function initAssistant() {
 
     const label = document.createElement("span");
     label.className = "msg-label";
-    label.textContent = role === "user" ? "You" : "Qwen 3.5";
+    label.textContent = role === "user" ? "You" : "Assistant";
 
     const bubble = document.createElement("div");
     bubble.className = `msg-bubble${cssClass ? ` ${cssClass}` : ""}`;
@@ -132,7 +132,7 @@ export function initAssistant() {
 
     const label = document.createElement("span");
     label.className = "msg-label";
-    label.textContent = "Qwen 3.5";
+    label.textContent = "Assistant";
 
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble thinking";
@@ -265,7 +265,7 @@ export function initAssistant() {
 
     const label = document.createElement("span");
     label.className = "msg-label";
-    label.textContent = "Qwen 3.5";
+    label.textContent = "Assistant";
 
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble feedback-queued";

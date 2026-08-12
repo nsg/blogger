@@ -27,6 +27,7 @@ Run these commands from the blog checkout. Ensure the checkout is writable by UI
 
 ```bash
 export OLLAMA_API_KEY='replace-with-ollama-key'
+export OLLAMA_MODEL='qwen3.5:397b'
 export OPENAI_API_KEY='replace-with-openai-key'
 export BLOGGER_PASSWORD='replace-with-login-password'
 export BLOGGER_SESSION_SECRET="$(openssl rand -hex 32)"
@@ -41,6 +42,7 @@ docker run --rm \
   --mount type=bind,src="$PWD",dst=/data \
   --workdir /data \
   --env OLLAMA_API_KEY \
+  --env OLLAMA_MODEL \
   --env OPENAI_API_KEY \
   --env BLOGGER_PASSWORD \
   --env BLOGGER_SESSION_SECRET \
@@ -63,7 +65,7 @@ npm ci
 npm run build
 ```
 
-Export the eight variables shown above, then run Blogger from the blog checkout. Using `--manifest-path` keeps the blog checkout as the process working directory, so no search-root argument is needed.
+Export the variables shown above, then run Blogger from the blog checkout. Using `--manifest-path` keeps the blog checkout as the process working directory, so no search-root argument is needed.
 
 ```bash
 cd /path/to/blog/checkout
@@ -72,11 +74,14 @@ cargo run --locked --manifest-path /path/to/blogger/Cargo.toml
 
 ## Configuration
 
-All environment variables are required and must be non-empty.
+All environment variables except `OLLAMA_MODEL` are required and must be non-empty.
+Set `OLLAMA_MODEL` at deployment time to change the writing assistant model; it
+defaults to `qwen3.5:397b` when omitted.
 
 | Variable | Description |
 | --- | --- |
 | `OLLAMA_API_KEY` | Authenticates requests from the AI writing assistant to Ollama. |
+| `OLLAMA_MODEL` | Selects the Ollama model used by the writing assistant. Defaults to `qwen3.5:397b`. |
 | `OPENAI_API_KEY` | Authenticates speech-to-text requests for dictation. |
 | `BLOGGER_PASSWORD` | Sets the plaintext password for the single-user login. |
 | `BLOGGER_SESSION_SECRET` | Signs login sessions; provide exactly 64 hexadecimal characters representing 32 random bytes. |

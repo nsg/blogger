@@ -82,10 +82,7 @@ pub async fn chat(
         )
     })?;
 
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("qwen3.5:397b");
+    let model = &state.ollama_model;
 
     let use_tools = body.get("tools").and_then(|t| t.as_bool()).unwrap_or(true);
 

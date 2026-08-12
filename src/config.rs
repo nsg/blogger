@@ -1,6 +1,9 @@
+pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3.5:397b";
+
 #[derive(Clone)]
 pub struct Config {
     pub ollama_key: String,
+    pub ollama_model: String,
     pub stt_api_key: String,
     pub password: String,
     pub session_secret: [u8; 32],
@@ -18,6 +21,7 @@ impl Config {
             parse_mcp_public_url(&required_var("BLOGGER_MCP_PUBLIC_URL")?)?;
         Ok(Self {
             ollama_key: required_var("OLLAMA_API_KEY")?,
+            ollama_model: optional_var("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)?,
             stt_api_key: required_var("OPENAI_API_KEY")?,
             password: required_var("BLOGGER_PASSWORD")?,
             session_secret: decode_session_secret(&required_var("BLOGGER_SESSION_SECRET")?)?,
@@ -28,6 +32,26 @@ impl Config {
             mcp_issuer,
             mcp_host,
         })
+    }
+}
+
+fn optional_var(name: &str, default: &str) -> Result<String, String> {
+    match std::env::var(name) {
+        Ok(value) => optional_value(name, Some(value), default),
+        Err(std::env::VarError::NotPresent) => optional_value(name, None, default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "optional environment variable {name} must be valid UTF-8"
+        )),
+    }
+}
+
+fn optional_value(name: &str, value: Option<String>, default: &str) -> Result<String, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() && value.trim() == value => Ok(value),
+        Some(_) => Err(format!(
+            "optional environment variable {name} must not be empty or contain surrounding whitespace when set"
+        )),
+        None => Ok(default.to_owned()),
     }
 }
 
@@ -95,7 +119,36 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_session_secret, parse_mcp_public_url};
+    use super::{
+        DEFAULT_OLLAMA_MODEL, decode_session_secret, optional_value, parse_mcp_public_url,
+    };
+
+    #[test]
+    fn defaults_and_validates_optional_values() {
+        assert_eq!(
+            optional_value("OLLAMA_MODEL", None, DEFAULT_OLLAMA_MODEL).unwrap(),
+            DEFAULT_OLLAMA_MODEL
+        );
+        assert_eq!(
+            optional_value(
+                "OLLAMA_MODEL",
+                Some("qwen3.6:35b".to_owned()),
+                DEFAULT_OLLAMA_MODEL
+            )
+            .unwrap(),
+            "qwen3.6:35b"
+        );
+        for invalid in ["", " ", "qwen3.5:397b\n"] {
+            assert!(
+                optional_value(
+                    "OLLAMA_MODEL",
+                    Some(invalid.to_owned()),
+                    DEFAULT_OLLAMA_MODEL
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn validates_and_decodes_session_secret() {
