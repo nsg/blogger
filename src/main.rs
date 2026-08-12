@@ -3,6 +3,9 @@ mod auth;
 mod config;
 mod git;
 mod handlers;
+mod mcp;
+mod oauth;
+mod post_store;
 mod posts;
 mod site;
 mod state;
@@ -65,8 +68,10 @@ async fn run() -> Result<(), String> {
 
     let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let zola = zola::spawn(&zola_root, ready_tx).await?;
+    let password_gate = Arc::new(auth::PasswordGate::new());
     let state = Arc::new(AppState {
         config,
+        password_gate: password_gate.clone(),
         http: reqwest::Client::new(),
         zola_root,
         repository,
@@ -114,20 +119,24 @@ async fn run() -> Result<(), String> {
         ))
         .with_state(state.clone());
 
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:3000").await {
-        Ok(listener) => listener,
-        Err(error) => {
-            state.zola.shutdown().await?;
-            return Err(match error.kind() {
-                std::io::ErrorKind::AddrInUse => {
-                    "Blogger cannot start because port 3000 is already in use".to_string()
-                }
-                _ => format!("failed to bind Blogger web UI to port 3000: {error}"),
-            });
-        }
-    };
+    let oauth_state = oauth::OAuthState::new(
+        state.config.password.clone(),
+        password_gate,
+        state.config.session_secret,
+        state.config.mcp_public_url.clone(),
+        state.config.mcp_issuer.clone(),
+    );
+    let (public_app, cancel_mcp) = oauth::public_router(
+        oauth_state,
+        state.zola_root.clone(),
+        state.config.mcp_host.clone(),
+    );
+
+    let listener = bind_listener(3000, "Blogger web UI", &state).await?;
+    let mcp_listener = bind_listener(3001, "Blogger MCP service", &state).await?;
 
     println!("listening on 0.0.0.0:3000");
+    println!("MCP listening on 0.0.0.0:3001");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(wait_for_shutdown(shutdown_tx));
 
@@ -139,20 +148,52 @@ async fn run() -> Result<(), String> {
         .into_future();
     tokio::pin!(server);
 
+    let mut mcp_server_shutdown = shutdown_rx.clone();
+    let mcp_server = axum::serve(mcp_listener, public_app)
+        .with_graceful_shutdown(async move {
+            let _ = mcp_server_shutdown.changed().await;
+        })
+        .into_future();
+    tokio::pin!(mcp_server);
+
     let mut shutdown_rx = shutdown_rx;
     let server_result = tokio::select! {
         result = &mut server => result.map_err(|e| format!("server error: {e}")),
+        result = &mut mcp_server => result.map_err(|e| format!("MCP server error: {e}")),
         _ = shutdown_rx.changed() => {
             println!("shutting down...");
-            if tokio::time::timeout(Duration::from_secs(5), &mut server).await.is_err() {
+            cancel_mcp();
+            if tokio::time::timeout(Duration::from_secs(5), async {
+                let _ = tokio::join!(&mut server, &mut mcp_server);
+            }).await.is_err() {
                 eprintln!("warning: HTTP shutdown grace period expired");
             }
             Ok(())
         }
     };
 
+    cancel_mcp();
     state.zola.shutdown().await?;
     server_result
+}
+
+async fn bind_listener(
+    port: u16,
+    label: &str,
+    state: &AppState,
+) -> Result<tokio::net::TcpListener, String> {
+    match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(listener) => Ok(listener),
+        Err(error) => {
+            state.zola.shutdown().await?;
+            Err(match error.kind() {
+                std::io::ErrorKind::AddrInUse => {
+                    format!("Blogger cannot start because port {port} is already in use")
+                }
+                _ => format!("failed to bind {label} to port {port}: {error}"),
+            })
+        }
+    }
 }
 
 fn search_root() -> Result<PathBuf, String> {

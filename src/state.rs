@@ -1,9 +1,10 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-use crate::{config::Config, git::Repository, zola::ZolaChild};
+use crate::{auth::PasswordGate, config::Config, git::Repository, zola::ZolaChild};
 
 pub struct AppState {
     pub config: Config,
+    pub password_gate: Arc<PasswordGate>,
     pub http: reqwest::Client,
     pub zola_root: PathBuf,
     pub repository: Repository,

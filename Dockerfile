@@ -31,5 +31,5 @@ COPY --from=zola /bin/zola /usr/local/bin/zola
 WORKDIR /data
 USER blogger
 
-EXPOSE 3000
+EXPOSE 3000 3001
 CMD ["blogger"]

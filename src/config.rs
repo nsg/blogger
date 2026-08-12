@@ -7,10 +7,15 @@ pub struct Config {
     pub github_token: String,
     pub git_name: String,
     pub git_email: String,
+    pub mcp_public_url: String,
+    pub mcp_issuer: String,
+    pub mcp_host: String,
 }
 
 impl Config {
     pub fn load() -> Result<Self, String> {
+        let (mcp_public_url, mcp_issuer, mcp_host) =
+            parse_mcp_public_url(&required_var("BLOGGER_MCP_PUBLIC_URL")?)?;
         Ok(Self {
             ollama_key: required_var("OLLAMA_API_KEY")?,
             stt_api_key: required_var("OPENAI_API_KEY")?,
@@ -19,8 +24,36 @@ impl Config {
             github_token: required_var("GITHUB_TOKEN")?,
             git_name: required_var("BLOGGER_GIT_NAME")?,
             git_email: required_var("BLOGGER_GIT_EMAIL")?,
+            mcp_public_url,
+            mcp_issuer,
+            mcp_host,
         })
     }
+}
+
+fn parse_mcp_public_url(value: &str) -> Result<(String, String, String), String> {
+    const ERROR: &str = "BLOGGER_MCP_PUBLIC_URL must be a public HTTPS URL ending in /mcp, for example https://mcp.example.com/mcp";
+    let url = reqwest::Url::parse(value).map_err(|_| ERROR.to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/mcp"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ERROR.to_owned());
+    }
+
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_owned(),
+    };
+    Ok((
+        url.to_string().trim_end_matches('/').to_owned(),
+        url.origin().ascii_serialization(),
+        host,
+    ))
 }
 
 fn required_var(name: &str) -> Result<String, String> {
@@ -62,7 +95,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_session_secret;
+    use super::{decode_session_secret, parse_mcp_public_url};
 
     #[test]
     fn validates_and_decodes_session_secret() {
@@ -77,5 +110,32 @@ mod tests {
         let invalid = decode_session_secret(&format!("{}g", "a".repeat(63))).unwrap_err();
         assert!(invalid.contains("openssl rand -hex 32"));
         assert!(decode_session_secret(&"AB".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn validates_the_canonical_mcp_url() {
+        assert_eq!(
+            parse_mcp_public_url("https://mcp.example.com/mcp").unwrap(),
+            (
+                "https://mcp.example.com/mcp".to_owned(),
+                "https://mcp.example.com".to_owned(),
+                "mcp.example.com".to_owned(),
+            )
+        );
+        assert_eq!(
+            parse_mcp_public_url("https://mcp.example.com:8443/mcp")
+                .unwrap()
+                .2,
+            "mcp.example.com:8443"
+        );
+        for invalid in [
+            "http://mcp.example.com/mcp",
+            "https://mcp.example.com/",
+            "https://user@mcp.example.com/mcp",
+            "https://mcp.example.com/mcp?x=1",
+            "not a url",
+        ] {
+            assert!(parse_mcp_public_url(invalid).is_err(), "accepted {invalid}");
+        }
     }
 }

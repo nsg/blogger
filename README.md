@@ -33,9 +33,11 @@ export BLOGGER_SESSION_SECRET="$(openssl rand -hex 32)"
 export GITHUB_TOKEN='replace-with-github-token'
 export BLOGGER_GIT_NAME='Your Name'
 export BLOGGER_GIT_EMAIL='you@example.com'
+export BLOGGER_MCP_PUBLIC_URL='https://mcp.example.com/mcp'
 
 docker run --rm \
-  --publish 3000:3000 \
+  --publish 127.0.0.1:3000:3000 \
+  --publish 127.0.0.1:3001:3001 \
   --mount type=bind,src="$PWD",dst=/data \
   --workdir /data \
   --env OLLAMA_API_KEY \
@@ -45,6 +47,7 @@ docker run --rm \
   --env GITHUB_TOKEN \
   --env BLOGGER_GIT_NAME \
   --env BLOGGER_GIT_EMAIL \
+  --env BLOGGER_MCP_PUBLIC_URL \
   ghcr.io/nsg/blogger
 ```
 
@@ -60,7 +63,7 @@ npm ci
 npm run build
 ```
 
-Export the seven variables shown above, then run Blogger from the blog checkout. Using `--manifest-path` keeps the blog checkout as the process working directory, so no search-root argument is needed.
+Export the eight variables shown above, then run Blogger from the blog checkout. Using `--manifest-path` keeps the blog checkout as the process working directory, so no search-root argument is needed.
 
 ```bash
 cd /path/to/blog/checkout
@@ -80,6 +83,7 @@ All environment variables are required and must be non-empty.
 | `GITHUB_TOKEN` | Authenticates HTTPS Git operations against the configured GitHub origin. |
 | `BLOGGER_GIT_NAME` | Sets the author and committer name for commits Blogger creates. |
 | `BLOGGER_GIT_EMAIL` | Sets the author and committer email for commits Blogger creates. |
+| `BLOGGER_MCP_PUBLIC_URL` | Canonical public HTTPS URL of the MCP endpoint, ending in `/mcp`, for example `https://mcp.example.com/mcp`. |
 
 Generate a session secret outside Blogger and keep it stable across restarts:
 
@@ -115,10 +119,56 @@ blogger [SEARCH_ROOT]
 
 | Port | Access | Service |
 | --- | --- | --- |
-| 3000 | Exposed | Blogger web UI and authenticated preview proxy. |
+| 3000 | Private | Blogger web UI and authenticated preview proxy. |
+| 3001 | Public through HTTPS proxy | Read-only MCP connector and its OAuth endpoints. |
 | 1111 | Internal on `127.0.0.1` | Zola live preview. Do not expose this port. |
 
 Use `GET /api/health` as the liveness probe. It reports that the Blogger process is serving requests. Use `GET /api/ready` as the readiness probe; it succeeds after the private Zola preview responds. Both endpoints are unauthenticated.
+
+## Claude remote connector
+
+Blogger provides a read-only remote MCP connector for Claude.ai and Claude
+Mobile. It exposes two tools: `search_posts`, which searches titles and complete
+Markdown across both published posts and drafts, and `get_post`, which retrieves
+the complete Markdown for a search result. The tools cannot edit files or invoke
+Git operations.
+
+Add the value of `BLOGGER_MCP_PUBLIC_URL` as a custom connector in Claude.ai.
+Claude discovers Blogger's OAuth endpoints automatically. The authorization page
+is served by Blogger and accepts `BLOGGER_PASSWORD`; the password is never sent
+to Claude. Authorization grants only the `posts:read` scope and cannot access the
+private web interface or REST API.
+
+### Deployment contract
+
+Kubernetes resources, DNS, and certificates are intentionally maintained outside
+this repository. The external deployment must:
+
+- route the public MCP hostname to container port `3001`, while keeping port
+  `3000` private;
+- terminate TLS so `BLOGGER_MCP_PUBLIC_URL` is reachable over public HTTPS;
+- preserve the original HTTP `Host` header, which Blogger validates against the
+  configured public URL;
+- route the entire dedicated hostname, including `/mcp`, `/authorize`, `/token`,
+  `/register`, `/revoke`, and `/.well-known/*`, to port `3001`;
+- support Streamable HTTP responses (`text/event-stream`), disable response
+  buffering for `/mcp`, and allow long-lived HTTP requests;
+- rate-limit public `POST /authorize` requests per source at the ingress in
+  addition to Blogger's built-in password-attempt limiter; and
+- continue using the private port `3000` endpoints for liveness and readiness
+  probes.
+
+The port `3001` listener does not mount the Blogger frontend, preview proxy, or
+private REST API, so routing the entire dedicated hostname does not expose them.
+Do not route a path-stripped `/mcp` prefix: Blogger expects the public endpoint to
+arrive as `/mcp`.
+
+Blogger uses in-memory MCP sessions and OAuth grants, consistent with its
+single-replica deployment requirement. A pod restart disconnects active MCP
+sessions and invalidates access and refresh tokens; reconnect and authorize the
+connector again. The dynamically registered Claude client ID is stable across
+restarts as long as `BLOGGER_SESSION_SECRET` remains unchanged. Rotating that
+secret requires removing and re-adding the connector in Claude.ai.
 
 ### Git publication
 

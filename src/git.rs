@@ -1416,6 +1416,9 @@ mod tests {
             github_token: "secret-token".to_owned(),
             git_name: "Blogger Test".to_owned(),
             git_email: "blogger@example.invalid".to_owned(),
+            mcp_public_url: "https://mcp.example.invalid/mcp".to_owned(),
+            mcp_issuer: "https://mcp.example.invalid".to_owned(),
+            mcp_host: "mcp.example.invalid".to_owned(),
         };
         let repository = validate_repository(&site_root, &config).await.unwrap();
         assert_eq!(repository.root, temporary.root.canonicalize().unwrap());

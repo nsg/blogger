@@ -26,12 +26,47 @@ struct LoginLimiter {
     blocked_until: Option<Instant>,
 }
 
-static LOGIN_LIMITER: Mutex<LoginLimiter> = Mutex::new(LoginLimiter {
-    failures: 0,
-    blocked_until: None,
-});
+pub struct PasswordGate {
+    limiter: Mutex<LoginLimiter>,
+}
 
-fn token_eq(left: &str, right: &str) -> bool {
+impl PasswordGate {
+    pub fn new() -> Self {
+        Self {
+            limiter: Mutex::new(LoginLimiter {
+                failures: 0,
+                blocked_until: None,
+            }),
+        }
+    }
+
+    pub fn verify(&self, password: Option<&str>, expected: &str) -> bool {
+        let now = Instant::now();
+        let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(blocked_until) = limiter.blocked_until {
+            if now < blocked_until {
+                return false;
+            }
+            limiter.failures = 0;
+            limiter.blocked_until = None;
+        }
+
+        if password.is_some_and(|password| token_eq(password, expected)) {
+            limiter.failures = 0;
+            limiter.blocked_until = None;
+            return true;
+        }
+
+        limiter.failures = limiter.failures.saturating_add(1);
+        if limiter.failures >= MAX_LOGIN_FAILURES {
+            limiter.blocked_until = Some(now + LOGIN_BLOCK_DURATION);
+        }
+        false
+    }
+}
+
+pub(crate) fn token_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
     let mut diff = left.len() ^ right.len();
@@ -171,31 +206,6 @@ fn request_password(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     }
 }
 
-fn login_allowed(password: Option<&str>, expected: &str) -> bool {
-    let now = Instant::now();
-    let mut limiter = LOGIN_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(blocked_until) = limiter.blocked_until {
-        if now < blocked_until {
-            return false;
-        }
-        limiter.failures = 0;
-        limiter.blocked_until = None;
-    }
-
-    if password.is_some_and(|password| token_eq(password, expected)) {
-        limiter.failures = 0;
-        limiter.blocked_until = None;
-        return true;
-    }
-
-    limiter.failures = limiter.failures.saturating_add(1);
-    if limiter.failures >= MAX_LOGIN_FAILURES {
-        limiter.blocked_until = Some(now + LOGIN_BLOCK_DURATION);
-    }
-    false
-}
-
 fn incorrect_password() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -212,7 +222,10 @@ pub async fn login(
     body: Bytes,
 ) -> Response {
     let password = request_password(&headers, &body);
-    if !login_allowed(password.as_deref(), &state.config.password) {
+    if !state
+        .password_gate
+        .verify(password.as_deref(), &state.config.password)
+    {
         return incorrect_password();
     }
 
