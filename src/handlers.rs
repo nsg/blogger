@@ -207,8 +207,28 @@ pub async fn web_fetch(
     Ok(Json(result))
 }
 
+fn strip_livereload(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<script") {
+        let Some(end) = rest[start..].find("</script>") else {
+            break;
+        };
+        let tag_end = start + end + "</script>".len();
+        if rest[start..tag_end].contains("livereload") {
+            result.push_str(&rest[..start]);
+        } else {
+            result.push_str(&rest[..tag_end]);
+        }
+        rest = &rest[tag_end..];
+    }
+    result.push_str(rest);
+    result
+}
+
 fn rewrite_preview_html(html: &str) -> String {
-    html.replace("href=\"/", "href=\"/preview-site/")
+    strip_livereload(html)
+        .replace("href=\"/", "href=\"/preview-site/")
         .replace("src=\"/", "src=\"/preview-site/")
         .replace("action=\"/", "action=\"/preview-site/")
         .replace("http://localhost:1111", "/preview-site")
@@ -745,6 +765,17 @@ pub async fn delete_image(
 #[cfg(test)]
 mod tests {
     use super::{rewrite_preview_css, rewrite_preview_html};
+
+    #[test]
+    fn strips_livereload_script_but_keeps_other_scripts() {
+        let html = r#"<body><script src="/app.js"></script><p>hi</p><script src="/livereload.js?port=1111&amp;mindelay=10"></script></body>"#;
+
+        let rewritten = rewrite_preview_html(html);
+
+        assert!(rewritten.contains(r#"src="/preview-site/app.js""#));
+        assert!(rewritten.contains("<p>hi</p>"));
+        assert!(!rewritten.contains("livereload"));
+    }
 
     #[test]
     fn rewrites_preview_asset_urls_to_proxy() {
