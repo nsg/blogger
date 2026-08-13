@@ -304,13 +304,27 @@ fn unauthorized(method: &Method) -> Response {
         .into_response()
 }
 
+fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/health"
+            | "/api/ready"
+            | "/auth/login"
+            | "/manifest.webmanifest"
+            | "/icons/blogger.svg"
+            | "/icons/blogger-192.png"
+            | "/icons/blogger-512.png"
+            | "/icons/blogger-maskable-512.png"
+    )
+}
+
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/api/health" | "/api/ready" | "/auth/login") {
+    if is_public_path(path) {
         return next.run(request).await;
     }
 
@@ -325,7 +339,7 @@ pub async fn require_auth(
 
 #[cfg(test)]
 mod tests {
-    use super::{SESSION_LIFETIME_SECS, sign_session, token_eq, verify_session};
+    use super::{SESSION_LIFETIME_SECS, is_public_path, sign_session, token_eq, verify_session};
 
     const SECRET: [u8; 32] = [0x5a; 32];
 
@@ -363,5 +377,34 @@ mod tests {
             now
         ));
         assert!(!verify_session(&session, &[0xa5; 32], now));
+    }
+
+    #[test]
+    fn exposes_only_the_install_metadata_assets() {
+        for path in [
+            "/manifest.webmanifest",
+            "/icons/blogger.svg",
+            "/icons/blogger-192.png",
+            "/icons/blogger-512.png",
+            "/icons/blogger-maskable-512.png",
+        ] {
+            assert!(
+                is_public_path(path),
+                "install asset should be public: {path}"
+            );
+        }
+
+        for path in [
+            "/",
+            "/index.html",
+            "/main.js",
+            "/icons/blogger-maskable.svg",
+            "/icons/missing.png",
+        ] {
+            assert!(
+                !is_public_path(path),
+                "app asset should remain private: {path}"
+            );
+        }
     }
 }
