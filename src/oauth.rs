@@ -892,12 +892,12 @@ mod tests {
             fs::create_dir_all(path.join("content/post/2026")).unwrap();
             fs::write(
                 path.join("content/post/2026/draft.md"),
-                "+++\ntitle = \"Voice Draft\"\ndate = 2026-08-12\ndraft = true\n+++\nA distinctive narwhal voice note.\n",
+                "+++\ntitle = \"Voice Draft\"\ndate = 2026-08-12\ndraft = true\n[taxonomies]\ntags = [\"voice\", \"shared\"]\n+++\nA distinctive narwhal voice note.\n",
             )
             .unwrap();
             fs::write(
                 path.join("content/post/2026/published.md"),
-                "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n+++\nPublic material.\n",
+                "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n[taxonomies]\ntags = [\"published\", \"shared\"]\n+++\nPublic material.\n",
             )
             .unwrap();
             fs::write(
@@ -1233,6 +1233,7 @@ mod tests {
                 "get_post",
                 "get_writing_style",
                 "list_archive",
+                "list_tags",
                 "replace_draft",
                 "replace_writing_style",
                 "search_posts"
@@ -1343,6 +1344,23 @@ mod tests {
         assert_eq!(
             archive["result"]["structuredContent"],
             json!(["Published", "Voice Draft"])
+        );
+
+        let tags = mcp_post(
+            &client,
+            &base,
+            &read_only_access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":25,"method":"tools/call",
+                "params":{"name":"list_tags","arguments":{}}
+            }),
+        )
+        .await;
+        let tags = sse_json(&tags.text().await.unwrap());
+        assert_eq!(
+            tags["result"]["structuredContent"],
+            json!(["published", "shared", "voice"])
         );
 
         let searched = mcp_post(
@@ -1576,7 +1594,7 @@ mod tests {
             crate::post_store::load_post(&site.0, "post/2026/published.md")
                 .unwrap()
                 .content,
-            "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n+++\nPublic material.\n"
+            "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n[taxonomies]\ntags = [\"published\", \"shared\"]\n+++\nPublic material.\n"
         );
 
         let final_draft =

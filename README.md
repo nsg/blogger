@@ -142,9 +142,10 @@ Use `GET /api/health` as the liveness probe. It reports that the Blogger process
 ## Claude remote connector
 
 Blogger provides a remote MCP connector for Claude.ai and Claude Mobile. It
-exposes `list_archive`, `search_posts`, and `get_post` for reading published
-posts and drafts. `list_archive` returns only post titles as a compact overview;
-`search_posts` matches those titles as well as the complete Markdown content.
+exposes `list_archive`, `list_tags`, `search_posts`, and `get_post` for reading
+published posts and drafts. `list_archive` returns only post titles and
+`list_tags` returns unique tags as compact overviews; `search_posts` matches
+titles as well as the complete Markdown content.
 `get_writing_style` reads the complete `WRITING_STYLE.md` file at the Zola site
 root, and `replace_writing_style` creates or replaces that file as a single
 Markdown document. A useful profile can cover voice and tone, structure and

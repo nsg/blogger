@@ -173,6 +173,20 @@ impl BlogMcp {
     }
 
     #[tool(
+        description = "List all tags used by published and draft blog posts as unique strings, sorted alphabetically without changing their authored casing. Use this compact overview to discover topics before calling search_posts.",
+        annotations(
+            title = "List blog tags",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_tags(&self) -> CallToolResult {
+        structured_result(self.posts.list_tags())
+    }
+
+    #[tool(
         description = "Search published and draft blog posts by title and Markdown content. Returns matching post paths, metadata, and excerpts; use get_post with a returned path to retrieve the complete post.",
         annotations(
             title = "Search blog posts",
@@ -367,7 +381,7 @@ impl ServerHandler for BlogMcp {
                     ),
             )
             .with_instructions(
-                "Call get_writing_style before drafting or revising prose. Use list_archive for a compact overview of post titles, then search_posts and get_post as needed. Writing tools require posts:write and current revisions. Draft tools preserve draft status. No MCP tool commits, pushes, publishes, or deletes.",
+                "Call get_writing_style before drafting or revising prose. Use list_archive and list_tags for compact overviews of existing posts, then search_posts and get_post as needed. Writing tools require posts:write and current revisions. Draft tools preserve draft status. No MCP tool commits, pushes, publishes, or deletes.",
             )
     }
 }
@@ -491,6 +505,7 @@ mod tests {
                 "get_post",
                 "get_writing_style",
                 "list_archive",
+                "list_tags",
                 "replace_draft",
                 "replace_writing_style",
                 "search_posts"
@@ -501,7 +516,7 @@ mod tests {
             assert_eq!(annotations.open_world_hint, Some(false));
             if matches!(
                 tool.name.as_ref(),
-                "get_post" | "get_writing_style" | "list_archive" | "search_posts"
+                "get_post" | "get_writing_style" | "list_archive" | "list_tags" | "search_posts"
             ) {
                 assert_eq!(annotations.read_only_hint, Some(true));
                 assert_eq!(annotations.destructive_hint, Some(false));

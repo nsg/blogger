@@ -15,6 +15,7 @@ pub struct FrontMatter {
     pub title: Option<String>,
     pub date: Option<String>,
     pub draft: bool,
+    pub tags: Vec<String>,
     pub slug: Option<String>,
     pub path: Option<String>,
     pub unsorted: bool,
@@ -26,6 +27,7 @@ pub struct PostMetadata {
     pub title: String,
     pub date: Option<String>,
     pub draft: bool,
+    pub tags: Vec<String>,
     pub unsorted: bool,
     pub url: String,
     pub revision: String,
@@ -94,6 +96,7 @@ pub fn parse_front_matter(content: &[u8]) -> FrontMatter {
         title: None,
         date: None,
         draft: false,
+        tags: Vec::new(),
         slug: None,
         path: None,
         unsorted: true,
@@ -137,6 +140,18 @@ pub fn parse_front_matter(content: &[u8]) -> FrontMatter {
         .get("draft")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
+    let tags = value
+        .get("taxonomies")
+        .and_then(toml::Value::as_table)
+        .and_then(|taxonomies| taxonomies.get("tags"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect();
     let slug = value
         .get("slug")
         .and_then(toml::Value::as_str)
@@ -151,6 +166,7 @@ pub fn parse_front_matter(content: &[u8]) -> FrontMatter {
         title,
         date,
         draft,
+        tags,
         slug,
         path,
         unsorted,
@@ -170,6 +186,7 @@ pub fn metadata_from_bytes(content_relative_path: &str, content: &[u8]) -> PostM
         title: front_matter.title.clone().unwrap_or(fallback_title),
         date: front_matter.date.clone(),
         draft: front_matter.draft,
+        tags: front_matter.tags.clone(),
         unsorted: front_matter.unsorted,
         url: effective_url(content_relative_path, &front_matter),
         revision: revision(content),
@@ -607,18 +624,28 @@ mod tests {
     #[test]
     fn parses_valid_toml_front_matter_and_defaults_draft() {
         let parsed = parse_front_matter(
-            b"+++\ntitle = \"Hello\"\ndate = \"2026-08-12T10:30:00Z\"\nslug = \"hello\"\npath = \"custom/hello\"\n+++\nBody\n",
+            b"+++\ntitle = \"Hello\"\ndate = \"2026-08-12T10:30:00Z\"\nslug = \"hello\"\npath = \"custom/hello\"\n[taxonomies]\ntags = [\"voice\", \" notes \", \"\"]\n+++\nBody\n",
         );
         assert_eq!(parsed.title.as_deref(), Some("Hello"));
         assert_eq!(parsed.date.as_deref(), Some("2026-08-12T10:30:00Z"));
         assert_eq!(parsed.slug.as_deref(), Some("hello"));
         assert_eq!(parsed.path.as_deref(), Some("custom/hello"));
+        assert_eq!(parsed.tags, ["voice", "notes"]);
         assert!(!parsed.draft);
         assert!(!parsed.unsorted);
 
         let draft =
             parse_front_matter(b"+++\ntitle = \"Draft\"\ndate = 2026-08-12\ndraft = true\n+++\n");
         assert!(draft.draft);
+        assert!(draft.tags.is_empty());
+
+        for malformed_tags in [
+            b"+++\ntaxonomies = \"tags\"\n+++\n".as_slice(),
+            b"+++\n[taxonomies]\ntags = \"notes\"\n+++\n".as_slice(),
+            b"+++\n[taxonomies]\n+++\n".as_slice(),
+        ] {
+            assert!(parse_front_matter(malformed_tags).tags.is_empty());
+        }
     }
 
     #[test]
@@ -633,6 +660,7 @@ mod tests {
             assert_eq!(metadata.title, "fallback");
             assert_eq!(metadata.date, None);
             assert!(!metadata.draft);
+            assert!(metadata.tags.is_empty());
         }
     }
 
@@ -667,6 +695,7 @@ mod tests {
             title: None,
             date: None,
             draft: false,
+            tags: Vec::new(),
             slug: None,
             path: None,
             unsorted: true,

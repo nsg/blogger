@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     fmt,
     fs::{self, OpenOptions},
     io::Write as _,
@@ -106,6 +107,10 @@ impl DraftStore {
 
     pub fn list_archive(&self) -> Result<Vec<String>, String> {
         list_archive(&self.zola_root)
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<String>, String> {
+        list_tags(&self.zola_root)
     }
 
     pub fn search_posts(&self, query: &str, limit: usize) -> Result<Vec<PostMatch>, String> {
@@ -392,6 +397,17 @@ pub fn list_archive(zola_root: &Path) -> Result<Vec<String>, String> {
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(posts.into_iter().map(|post| post.title).collect())
+}
+
+pub fn list_tags(zola_root: &Path) -> Result<Vec<String>, String> {
+    let mut tags = site::scan_posts(zola_root)?
+        .into_iter()
+        .flat_map(|post| post.tags)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    tags.sort_by_cached_key(|tag| tag.to_lowercase());
+    Ok(tags)
 }
 
 pub fn search_posts(zola_root: &Path, query: &str, limit: usize) -> Result<Vec<PostMatch>, String> {
@@ -837,7 +853,7 @@ mod tests {
 
     use super::{
         AppendSeparator, DraftStore, ExactReplacement, MAX_EXCERPT_CHARS, MAX_SEARCH_RESULTS,
-        list_archive, load_post, search_posts, split_document,
+        list_archive, list_tags, load_post, search_posts, split_document,
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -984,6 +1000,25 @@ mod tests {
         assert_eq!(
             list_archive(site.path()).unwrap(),
             ["Alpha", "Beta", "Older", "Bad date", "titleless"]
+        );
+    }
+
+    #[test]
+    fn lists_unique_tags_alphabetically() {
+        let site = TempSite::new();
+        site.write_post(
+            "post/one.md",
+            b"+++\ntitle = \"One\"\ndate = 2026-01-01\n[taxonomies]\ntags = [\" rust \", \"notes\", \"  \", \"Zola\"]\n+++\nbody",
+        );
+        site.write_post(
+            "post/two.md",
+            b"+++\ntitle = \"Two\"\ndate = 2026-01-02\n[taxonomies]\ntags = [\"notes\", \"travel\", 3]\n+++\nbody",
+        );
+        site.write_post("post/malformed.md", b"Markdown without front matter");
+
+        assert_eq!(
+            list_tags(site.path()).unwrap(),
+            ["notes", "rust", "travel", "Zola"]
         );
     }
 
