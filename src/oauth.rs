@@ -1232,6 +1232,7 @@ mod tests {
                 "edit_draft",
                 "get_post",
                 "get_writing_style",
+                "list_archive",
                 "replace_draft",
                 "replace_writing_style",
                 "search_posts"
@@ -1325,6 +1326,23 @@ mod tests {
         assert_eq!(
             stale_style["result"]["structuredContent"]["error"],
             "revision_conflict"
+        );
+
+        let archive = mcp_post(
+            &client,
+            &base,
+            &read_only_access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":24,"method":"tools/call",
+                "params":{"name":"list_archive","arguments":{}}
+            }),
+        )
+        .await;
+        let archive = sse_json(&archive.text().await.unwrap());
+        assert_eq!(
+            archive["result"]["structuredContent"],
+            json!(["Published", "Voice Draft"])
         );
 
         let searched = mcp_post(

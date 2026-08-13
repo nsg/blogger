@@ -104,6 +104,10 @@ impl DraftStore {
         load_post(&self.zola_root, path)
     }
 
+    pub fn list_archive(&self) -> Result<Vec<String>, String> {
+        list_archive(&self.zola_root)
+    }
+
     pub fn search_posts(&self, query: &str, limit: usize) -> Result<Vec<PostMatch>, String> {
         search_posts(&self.zola_root, query, limit)
     }
@@ -378,23 +382,35 @@ pub fn load_post(zola_root: &Path, path: &str) -> Result<PostDocument, String> {
     })
 }
 
+pub fn list_archive(zola_root: &Path) -> Result<Vec<String>, String> {
+    let mut posts = site::scan_posts(zola_root)?;
+    posts.sort_by(|left, right| {
+        left.unsorted
+            .cmp(&right.unsorted)
+            .then_with(|| right.date.cmp(&left.date))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(posts.into_iter().map(|post| post.title).collect())
+}
+
 pub fn search_posts(zola_root: &Path, query: &str, limit: usize) -> Result<Vec<PostMatch>, String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("search query must not be empty".to_owned());
     }
 
-    let lowercase_query = query.to_lowercase();
     let mut matches = site::scan_posts(zola_root)?
         .into_iter()
         .map(|metadata| load_post(zola_root, &metadata.path))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter_map(|post| {
-            let title_match = post.title.to_lowercase().contains(&lowercase_query);
-            let content_match = post.content.to_lowercase().contains(&lowercase_query);
-            (title_match || content_match).then(|| RankedMatch {
-                excerpt: matching_excerpt(&post.content, query),
+            let search_text = format!("{}\n{}", post.title, post.content);
+            let match_range = find_case_insensitive(&search_text, query)?;
+            let title_match = match_range.1 <= post.title.len();
+            Some(RankedMatch {
+                excerpt: matching_excerpt(&search_text, match_range),
                 post,
                 title_match,
             })
@@ -771,10 +787,7 @@ fn date_key(date: &Option<String>) -> Option<i64> {
         .ok()
 }
 
-fn matching_excerpt(content: &str, query: &str) -> String {
-    let Some((match_start_byte, match_end_byte)) = find_case_insensitive(content, query) else {
-        return String::new();
-    };
+fn matching_excerpt(content: &str, (match_start_byte, match_end_byte): (usize, usize)) -> String {
     let chars = content.chars().collect::<Vec<_>>();
     let match_start = content[..match_start_byte].chars().count();
     let match_end = match_start + content[match_start_byte..match_end_byte].chars().count();
@@ -824,7 +837,7 @@ mod tests {
 
     use super::{
         AppendSeparator, DraftStore, ExactReplacement, MAX_EXCERPT_CHARS, MAX_SEARCH_RESULTS,
-        load_post, search_posts, split_document,
+        list_archive, load_post, search_posts, split_document,
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -942,6 +955,51 @@ mod tests {
         assert_eq!(matches[1].path, "post/2026/body.md");
         assert!(matches[1].draft);
         assert!(matches[1].excerpt.to_lowercase().contains("rust"));
+    }
+
+    #[test]
+    fn lists_only_archive_titles_newest_first() {
+        let site = TempSite::new();
+        site.write_post(
+            "post/older.md",
+            post("Older", "2025-01-01", false, "body").as_bytes(),
+        );
+        site.write_post(
+            "post/b.md",
+            post("Beta", "2026-01-01", true, "body").as_bytes(),
+        );
+        site.write_post(
+            "post/a.md",
+            post("Alpha", "2026-01-01", false, "body").as_bytes(),
+        );
+        site.write_post(
+            "post/titleless.md",
+            b"+++\ndate = \"2027-01-01\"\n+++\nbody",
+        );
+        site.write_post(
+            "post/bad-date.md",
+            post("Bad date", "someday", false, "body").as_bytes(),
+        );
+
+        assert_eq!(
+            list_archive(site.path()).unwrap(),
+            ["Alpha", "Beta", "Older", "Bad date", "titleless"]
+        );
+    }
+
+    #[test]
+    fn includes_fallback_titles_in_the_search_text() {
+        let site = TempSite::new();
+        site.write_post(
+            "post/fallback-title.md",
+            b"Markdown without TOML front matter",
+        );
+
+        let matches = search_posts(site.path(), "fallback-title", 5).unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "fallback-title");
+        assert!(matches[0].excerpt.contains("fallback-title"));
     }
 
     #[test]
