@@ -346,13 +346,27 @@ export async function initPreview() {
   const input = document.getElementById("url-input") as HTMLInputElement;
   let selectedPath: string | null = null;
   let previewUrl: string | null = null;
-  let lastContentLength: string | null = null;
+  let lastDigest: string | null = null;
+  let selectionInitialized = false;
+  let previewGeneration = 0;
+
+  function versionedPreviewUrl(url: string, digest: string) {
+    const separator = url.includes("?") ? "&" : "?";
+    return `${url}${separator}revision=${encodeURIComponent(digest)}`;
+  }
 
   window.addEventListener("blogger-post-selected", (event: Event) => {
     const detail = (event as CustomEvent<{ path: string | null; url: string | null }>).detail;
+    const nextPreviewUrl = detail.url ? `/preview-site${detail.url}` : null;
+    const selectionChanged = !selectionInitialized
+      || detail.path !== selectedPath
+      || nextPreviewUrl !== previewUrl;
+    selectionInitialized = true;
+    previewGeneration += 1;
     selectedPath = detail.path;
-    previewUrl = detail.url ? `/preview-site${detail.url}` : null;
-    lastContentLength = null;
+    previewUrl = nextPreviewUrl;
+    if (!selectionChanged) return;
+    lastDigest = null;
     if (previewUrl) {
       iframe.src = previewUrl;
       input.value = previewUrl;
@@ -364,27 +378,30 @@ export async function initPreview() {
     }
   });
   window.addEventListener("blogger-preview-refresh", () => {
+    previewGeneration += 1;
     if (previewUrl) iframe.src = previewUrl;
   });
 
   setInterval(async () => {
     if (!selectedPath || !previewUrl) return;
+    const checkedPath = selectedPath;
+    const checkedUrl = previewUrl;
+    const checkedGeneration = previewGeneration;
     try {
-      const res = await fetch(`/api/preview-check?path=${encodeURIComponent(selectedPath)}`);
+      const res = await fetch(`/api/preview-check?path=${encodeURIComponent(checkedPath)}`, { cache: "no-store" });
       if (res.status === 401) {
         location.reload();
         return;
       }
       if (!res.ok) return;
       const data = await res.json();
-      const cl = data.content_length as string | null;
-      if (!cl) return;
-      if (lastContentLength === null) {
-        lastContentLength = cl;
-      } else if (cl !== lastContentLength) {
-        lastContentLength = cl;
-        iframe.src = previewUrl!;
-      }
+      if (checkedGeneration !== previewGeneration
+        || checkedPath !== selectedPath
+        || checkedUrl !== previewUrl) return;
+      const digest = typeof data.digest === "string" ? data.digest : null;
+      if (!digest || digest === lastDigest) return;
+      lastDigest = digest;
+      iframe.src = versionedPreviewUrl(checkedUrl, digest);
     } catch {
       // ignore poll errors
     }

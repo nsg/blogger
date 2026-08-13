@@ -292,7 +292,7 @@ pub async fn preview_check(
     let metadata = site::post_from_content(&relative, &content);
     let response = state
         .http
-        .head(format!("http://127.0.0.1:1111{}", metadata.url))
+        .get(format!("http://127.0.0.1:1111{}", metadata.url))
         .send()
         .await
         .map_err(|error| {
@@ -301,11 +301,25 @@ pub async fn preview_check(
                 Json(json!({ "error": format!("preview unavailable: {error}") })),
             )
         })?;
-    let content_length = response
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok());
-    Ok(Json(json!({ "content_length": content_length })))
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!("preview returned {}", response.status()),
+            })),
+        ));
+    }
+    let body = response.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("failed to read preview: {error}") })),
+        )
+    })?;
+    Ok(Json(json!({ "digest": preview_digest(&body) })))
+}
+
+fn preview_digest(bytes: &[u8]) -> String {
+    site::revision(bytes)
 }
 
 pub fn revision(bytes: &[u8]) -> String {
@@ -654,8 +668,8 @@ mod tests {
     };
 
     use super::{
-        date_year, rename_without_overwrite, resolve_existing_post, resolve_new_post, revision,
-        serialize_new_post,
+        date_year, preview_digest, rename_without_overwrite, resolve_existing_post,
+        resolve_new_post, revision, serialize_new_post,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -694,6 +708,15 @@ mod tests {
             revision(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn preview_digest_distinguishes_equal_length_pages() {
+        let before = b"<main><p>cat</p></main>";
+        let after = b"<main><p>dog</p></main>";
+
+        assert_eq!(before.len(), after.len());
+        assert_ne!(preview_digest(before), preview_digest(after));
     }
 
     #[test]
