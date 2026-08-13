@@ -1,0 +1,35 @@
+{
+  "id": "/",
+  "name": "Blogger",
+  "short_name": "Blogger",
+  "description": "A self-hosted writing environment for Zola blogs.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#121212",
+  "theme_color": "#121212",
+  "categories": ["productivity", "utilities"],
+  "launch_handler": {
+    "client_mode": "focus-existing"
+  },
+  "icons": [
+    {
+      "src": "/icons/blogger-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/blogger-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/blogger-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Blogger">
+  <defs>
+    <linearGradient id="background" x1="48" y1="40" x2="464" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#292b64"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="128" y1="126" x2="388" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="shadow" x="70" y="80" width="372" height="360" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020617" flood-opacity=".38"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" fill="#111827"/>
+  <rect width="512" height="512" rx="112" fill="url(#background)"/>
+  <g filter="url(#shadow)" stroke="url(#brand)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m128 183 128-64 128 64-128 64-128-64Z" fill="url(#brand)" stroke="none"/>
+    <path d="m128 260 128 64 128-64" fill="none"/>
+    <path d="m128 337 128 64 128-64" fill="none"/>
+  </g>
+</svg>

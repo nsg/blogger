@@ -57,6 +57,12 @@ docker run --rm \
 
 Open `http://localhost:3000`. Put Blogger behind an HTTPS reverse proxy when exposing it outside the host.
 
+### Install on Android or desktop
+
+Open Blogger in Chrome, sign in, and choose **Install app** (or **Add to Home screen**) from the browser menu. Blogger then launches in its own app window from the home screen or application launcher. Launching the icon again focuses the existing Blogger window on Chromium browsers that support launch handling.
+
+Installation requires HTTPS when Blogger is accessed from another device; `localhost` is the browser-supported exception. Blogger remains network-dependent and does not cache posts or application data for offline use.
+
 ### Running from source
 
 Install Node.js 22, the stable Rust toolchain, and Zola, and ensure `zola` is on `PATH`. Build the embedded frontend from the Blogger source checkout:

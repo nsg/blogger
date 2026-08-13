@@ -23,3 +23,29 @@ pub async fn static_handler(uri: Uri) -> Response {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Assets;
+
+    #[test]
+    fn embeds_installable_web_app_metadata_and_icons() {
+        let manifest = Assets::get("manifest.webmanifest").expect("manifest should be embedded");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest.data).expect("manifest should be valid JSON");
+
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["launch_handler"]["client_mode"], "focus-existing");
+
+        for icon in manifest["icons"]
+            .as_array()
+            .expect("manifest icons should be an array")
+        {
+            let path = icon["src"]
+                .as_str()
+                .expect("manifest icon should have a source")
+                .trim_start_matches('/');
+            assert!(Assets::get(path).is_some(), "missing embedded icon: {path}");
+        }
+    }
+}
