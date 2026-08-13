@@ -10,6 +10,7 @@ mod posts;
 mod site;
 mod state;
 mod tools;
+mod writing_style;
 mod zola;
 
 use std::{future::IntoFuture, io::Write, path::PathBuf, sync::Arc, time::Duration};

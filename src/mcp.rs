@@ -14,7 +14,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::post_store;
+use crate::{post_store, writing_style};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 20;
@@ -115,16 +115,28 @@ pub struct AppendDraftRequest {
     pub separator: AppendSeparatorRequest,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplaceWritingStyleRequest {
+    /// Exact current revision returned by get_writing_style. Omit it only when get_writing_style returns a null revision.
+    pub revision: Option<String>,
+    /// Complete replacement writing-style Markdown.
+    pub content: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlogMcp {
     posts: post_store::DraftStore,
+    writing_style: writing_style::WritingStyleStore,
     tool_router: ToolRouter<Self>,
 }
 
 impl BlogMcp {
     pub fn new(zola_root: impl Into<PathBuf>, coordinator: Arc<Mutex<()>>) -> Self {
+        let zola_root = zola_root.into();
         Self {
-            posts: post_store::DraftStore::new(zola_root.into(), coordinator),
+            posts: post_store::DraftStore::new(zola_root.clone(), coordinator.clone()),
+            writing_style: writing_style::WritingStyleStore::new(zola_root, coordinator),
             tool_router: Self::tool_router(),
         }
     }
@@ -132,6 +144,20 @@ impl BlogMcp {
 
 #[tool_router]
 impl BlogMcp {
+    #[tool(
+        description = "Retrieve the blog's complete writing-style profile. Use it before drafting or revising prose so the result follows the author's voice, tone, structure, vocabulary, formatting, and stated avoidances. An uninitialized profile is returned as empty content with a null revision.",
+        annotations(
+            title = "Get writing style",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_writing_style(&self) -> CallToolResult {
+        writing_style_load_result(self.writing_style.load())
+    }
+
     #[tool(
         description = "Search published and draft blog posts by title and Markdown content. Returns matching post paths, metadata, and excerpts; use get_post with a returned path to retrieve the complete post.",
         annotations(
@@ -227,6 +253,31 @@ impl BlogMcp {
     }
 
     #[tool(
+        description = "Replace the complete blog writing-style profile. Pass the exact revision returned by get_writing_style; omit revision only when that call returns a null revision. Normal Blogger Git publication versions the profile with the blog. This only changes the working checkout; it does not commit or push.",
+        annotations(
+            title = "Replace complete writing style",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn replace_writing_style(
+        &self,
+        Parameters(request): Parameters<ReplaceWritingStyleRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        if let Err(result) = require_write_scope(&parts) {
+            return result;
+        }
+        writing_style_result(
+            self.writing_style
+                .replace(request.revision.as_deref(), &request.content)
+                .await,
+        )
+    }
+
+    #[tool(
         description = "Atomically revise only a draft's Markdown body with exact old_text/new_text replacements. Every old_text must be non-empty and occur exactly once, and the exact current revision is required. Use replace_draft to change front matter. Nothing is written if any replacement fails.",
         annotations(
             title = "Edit passages in blog draft",
@@ -297,10 +348,12 @@ impl ServerHandler for BlogMcp {
             .with_server_info(
                 Implementation::new("blogger", env!("CARGO_PKG_VERSION"))
                     .with_title("Blogger")
-                    .with_description("Read access to blog posts and safe draft writing"),
+                    .with_description(
+                        "Blog post access, versioned writing-style guidance, and safe draft writing",
+                    ),
             )
             .with_instructions(
-                "Use search_posts and get_post to read posts. Draft-writing tools require posts:write, always preserve draft status, require current revisions, and never commit, push, publish, or delete.",
+                "Call get_writing_style before drafting or revising prose, then use search_posts and get_post as needed. Writing tools require posts:write and current revisions. Draft tools preserve draft status. No MCP tool commits, pushes, publishes, or deletes.",
             )
     }
 }
@@ -338,6 +391,30 @@ fn draft_result(
     }
 }
 
+fn writing_style_result(
+    result: Result<writing_style::WritingStyleMutation, writing_style::WritingStyleError>,
+) -> CallToolResult {
+    match result {
+        Ok(value) => structured_result::<_, writing_style::WritingStyleError>(Ok(value)),
+        Err(error) => match serde_json::to_value(&error) {
+            Ok(value) => CallToolResult::structured_error(value),
+            Err(serialization) => structured_error("serialization_error", serialization),
+        },
+    }
+}
+
+fn writing_style_load_result(
+    result: Result<writing_style::WritingStyleDocument, writing_style::WritingStyleError>,
+) -> CallToolResult {
+    match result {
+        Ok(value) => structured_result::<_, writing_style::WritingStyleError>(Ok(value)),
+        Err(error) => match serde_json::to_value(&error) {
+            Ok(value) => CallToolResult::structured_error(value),
+            Err(serialization) => structured_error("serialization_error", serialization),
+        },
+    }
+}
+
 fn require_write_scope(parts: &Parts) -> Result<(), CallToolResult> {
     if parts
         .extensions
@@ -348,7 +425,7 @@ fn require_write_scope(parts: &Parts) -> Result<(), CallToolResult> {
     } else {
         Err(CallToolResult::structured_error(serde_json::json!({
             "error": "insufficient_scope",
-            "message": "This connector has read-only access. Reauthorize it with draft-write access and retry."
+            "message": "This connector has read-only access. Reauthorize it with write access and retry."
         })))
     }
 }
@@ -384,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn describes_closed_world_read_and_draft_tools() {
+    fn describes_closed_world_read_and_writing_tools() {
         let server = BlogMcp::new("/unused", Arc::new(Mutex::new(())));
         let tools = server.tool_router.list_all();
 
@@ -398,14 +475,19 @@ mod tests {
                 "create_draft",
                 "edit_draft",
                 "get_post",
+                "get_writing_style",
                 "replace_draft",
+                "replace_writing_style",
                 "search_posts"
             ]
         );
         for tool in tools {
             let annotations = tool.annotations.as_ref().unwrap();
             assert_eq!(annotations.open_world_hint, Some(false));
-            if matches!(tool.name.as_ref(), "get_post" | "search_posts") {
+            if matches!(
+                tool.name.as_ref(),
+                "get_post" | "get_writing_style" | "search_posts"
+            ) {
                 assert_eq!(annotations.read_only_hint, Some(true));
                 assert_eq!(annotations.destructive_hint, Some(false));
                 assert_eq!(annotations.idempotent_hint, Some(true));

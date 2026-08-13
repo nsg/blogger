@@ -16,8 +16,9 @@ Run Blogger as a container in front of an existing Git checkout of the blog. Blo
 - Browse and manage posts from an archive panel.
 - Edit multiple posts with automatic saves and external-change conflict detection.
 - Create and preview draft posts.
-- Search, create, and revise drafts from Claude.ai chat or Claude Mobile voice
-  mode through the protected remote MCP connector.
+- Share a versioned writing-style profile and search, create, or revise drafts
+  from Claude.ai chat or Claude Mobile voice mode through the protected remote
+  MCP connector.
 - Review writing with an AI assistant and insert speech-to-text dictation.
 - Preview the site through an authenticated live Zola view.
 - Commit all checkout changes and push them to GitHub manually.
@@ -116,7 +117,7 @@ Create a fine-grained GitHub personal access token. Restrict its repository acce
 - Check out a normal branch and configure it to track the matching `origin/<branch>` upstream.
 - Configure `origin` with an HTTPS URL.
 - Provide a Zola site with `content/post`. Set `[slugify].paths = "on"` in `config.toml`, or omit that setting to use Zola's supported default.
-- Allow Blogger to write `content/post` and `static/images`.
+- Allow Blogger to write the Zola site root, `content/post`, and `static/images`.
 
 The deployment must populate the checkout before Blogger starts; Blogger never clones it. Run exactly one Blogger replica against a checkout. Multiple processes or replicas sharing one working tree are unsupported.
 
@@ -141,8 +142,15 @@ Use `GET /api/health` as the liveness probe. It reports that the Blogger process
 ## Claude remote connector
 
 Blogger provides a remote MCP connector for Claude.ai and Claude Mobile. It
-exposes `search_posts` and `get_post` for reading published posts and drafts. It
-also exposes four draft-only writing tools:
+exposes `search_posts` and `get_post` for reading published posts and drafts.
+`get_writing_style` reads the complete `WRITING_STYLE.md` file at the Zola site
+root, and `replace_writing_style` creates or replaces that file as a single
+Markdown document. A useful profile can cover voice and tone, structure and
+pacing, vocabulary, formatting conventions, examples, and patterns to avoid.
+Because the file is inside the blog checkout, Blogger's normal **Commit and
+push** flow versions it alongside the blog.
+
+The connector also exposes four draft-only writing tools:
 
 - `create_draft` creates a new draft from raw TOML front matter and a separate
   Markdown body. The optional slug is generated from the title when omitted.
@@ -152,16 +160,19 @@ also exposes four draft-only writing tools:
 - `replace_draft` replaces the complete front matter and body.
 
 Send front matter as raw TOML without `+++` delimiters. Blogger validates it and
-always writes `draft = true`. Updates require the exact revision returned by
-`get_post` or the previous write, preventing silent overwrites. The connector
-cannot modify published posts, publish, delete, rename, manage images, commit,
-push, or access arbitrary files.
+always writes `draft = true`. Draft updates require the exact revision returned
+by `get_post` or the previous write. Writing-style replacements likewise
+require the revision returned by `get_writing_style`; omit it only when that
+tool returns a null revision. These checks prevent silent overwrites. The
+connector cannot modify published posts, publish, delete, rename, manage images,
+commit, push, or access arbitrary files other than the fixed writing-style file.
 
 Add the value of `BLOGGER_MCP_PUBLIC_URL` as a custom connector in Claude.ai.
 Claude discovers Blogger's OAuth endpoints automatically. The authorization page
 is served by Blogger and accepts `BLOGGER_PASSWORD`; the password is never sent
 to Claude. Authorization grants `posts:read` and `posts:write`. Write access is
-limited to drafts and cannot access the private web interface or REST API.
+limited to drafts and the fixed writing-style guide; it cannot access the
+private web interface or REST API.
 
 After upgrading an existing read-only deployment, reauthorize the connector so
 Claude receives `posts:write`. Existing read-only tokens never acquire write

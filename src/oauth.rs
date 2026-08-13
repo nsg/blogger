@@ -386,7 +386,7 @@ async fn authorize_page(
     })
     .collect::<String>();
     let page = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize Claude</h1><p>Allow access to read blog posts and create or edit drafts. Claude cannot publish, delete, commit, or push.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize Claude</h1><p>Allow access to read blog posts and the writing-style guide, and to create or edit drafts or replace that guide. Claude cannot publish, delete, commit, or push.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#
     );
     secure_html(Html(page))
 }
@@ -900,6 +900,11 @@ mod tests {
                 "+++\ntitle = \"Published\"\ndate = 2026-08-12\ndraft = false\n+++\nPublic material.\n",
             )
             .unwrap();
+            fs::write(
+                path.join(crate::writing_style::WRITING_STYLE_PATH),
+                "# Writing style\n\nWarm, direct, and fond of narwhals.\n",
+            )
+            .unwrap();
             Self(path)
         }
     }
@@ -1090,7 +1095,7 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         let page = page.text().await.unwrap();
         assert!(page.contains("Authorize Claude"));
-        assert!(page.contains("create or edit drafts"));
+        assert!(page.contains("writing-style guide"));
 
         let wrong = authorize_code(
             &client,
@@ -1226,9 +1231,100 @@ mod tests {
                 "create_draft",
                 "edit_draft",
                 "get_post",
+                "get_writing_style",
                 "replace_draft",
+                "replace_writing_style",
                 "search_posts"
             ]
+        );
+
+        let style = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":20,"method":"tools/call",
+                "params":{"name":"get_writing_style","arguments":{}}
+            }),
+        )
+        .await;
+        let style = sse_json(&style.text().await.unwrap());
+        assert_eq!(style["result"]["isError"], false);
+        let style = &style["result"]["structuredContent"];
+        assert_eq!(style.as_object().unwrap().len(), 2);
+        assert!(style["content"].as_str().unwrap().contains("narwhals"));
+        let style_revision = style["revision"].as_str().unwrap().to_owned();
+
+        let read_only_access = insert_read_only_token(&state);
+        let denied_style_write = mcp_post(
+            &client,
+            &base,
+            &read_only_access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":21,"method":"tools/call",
+                "params":{"name":"replace_writing_style","arguments":{
+                    "revision":style_revision,
+                    "content":"must not be written"
+                }}
+            }),
+        )
+        .await;
+        let denied_style_write = sse_json(&denied_style_write.text().await.unwrap());
+        assert_eq!(denied_style_write["result"]["isError"], true);
+        assert_eq!(
+            denied_style_write["result"]["structuredContent"]["error"],
+            "insufficient_scope"
+        );
+
+        let replaced_style = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":22,"method":"tools/call",
+                "params":{"name":"replace_writing_style","arguments":{
+                    "revision":style_revision,
+                    "content":"# Writing style\n\nPrecise, warm, and concise.\n"
+                }}
+            }),
+        )
+        .await;
+        let replaced_style = sse_json(&replaced_style.text().await.unwrap());
+        assert_eq!(replaced_style["result"]["isError"], false);
+        assert_eq!(
+            replaced_style["result"]["structuredContent"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(site.0.join(crate::writing_style::WRITING_STYLE_PATH)).unwrap(),
+            "# Writing style\n\nPrecise, warm, and concise.\n"
+        );
+
+        let stale_style = mcp_post(
+            &client,
+            &base,
+            access,
+            Some(&session),
+            json!({
+                "jsonrpc":"2.0","id":23,"method":"tools/call",
+                "params":{"name":"replace_writing_style","arguments":{
+                    "revision":style_revision,
+                    "content":"stale"
+                }}
+            }),
+        )
+        .await;
+        let stale_style = sse_json(&stale_style.text().await.unwrap());
+        assert_eq!(stale_style["result"]["isError"], true);
+        assert_eq!(
+            stale_style["result"]["structuredContent"]["error"],
+            "revision_conflict"
         );
 
         let searched = mcp_post(
@@ -1295,7 +1391,6 @@ mod tests {
         );
         let created_revision = created["revision"].as_str().unwrap().to_owned();
 
-        let read_only_access = insert_read_only_token(&state);
         let denied_write = mcp_post(
             &client,
             &base,
