@@ -26,9 +26,9 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build frontend
+      - name: Test frontend
         working-directory: frontend
-        run: npm run build
+        run: npm test
 
       - name: Update stable Rust toolchain
         run: |

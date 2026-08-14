@@ -7,7 +7,8 @@ import { ApiError } from "./api.js";
 import { api, jsonRequest, mutationEvent } from "./api.js";
 import type { IModelDeltaDecoration, PostDocumentController, PostResponse, RecoverPostResponse, SaveResponse } from "./types.js";
 import * as S from "./state.js";
-import { field, modalButton, openModal, showModalError } from "./modal.js";
+import { field, modalButton, openModal, showModalError, showToast } from "./modal.js";
+import { formatImageLine, parseImageLine, type EditableImage } from "./image-syntax.js";
 import {
   reconcileParagraphs,
   getParagraphAtLine,
@@ -23,23 +24,17 @@ type VoiceRecordingMode =
   | { kind: "dictation" }
   | { kind: "paragraph-command"; paragraphId: string };
 
-const IMAGE_LINE_RE = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/;
 const FEEDBACK_ICON_SVG =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/></svg>';
 const MIC_ICON_SVG =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/></svg>';
 
-function parseImageLine(line: string): { alt: string; path: string } | null {
-  const m = line.match(IMAGE_LINE_RE);
-  return m ? { alt: m[1], path: m[2] } : null;
-}
-
 function showImageEditDialog(
-  imagePath: string,
-  onRename: (newName: string) => void,
+  image: EditableImage,
+  onSave: (newName: string, invert: boolean) => void,
   onDelete: () => void,
 ) {
-  const currentName = imagePath.split("/").pop() || "";
+  const currentName = image.path.split("/").pop() || "";
 
   const overlay = document.createElement("div");
   overlay.className = "image-dialog-overlay";
@@ -56,6 +51,14 @@ function showImageEditDialog(
   input.className = "image-dialog-input";
   input.value = currentName;
 
+  const invert = document.createElement("input");
+  invert.type = "checkbox";
+  invert.checked = image.invert;
+
+  const invertLabel = document.createElement("label");
+  invertLabel.className = "modal-checkbox image-invert-toggle";
+  invertLabel.append(invert, document.createTextNode("Invert colors in dark mode"));
+
   const buttons = document.createElement("div");
   buttons.className = "image-dialog-buttons";
 
@@ -67,15 +70,16 @@ function showImageEditDialog(
   cancelBtn.className = "image-dialog-btn cancel";
   cancelBtn.textContent = "Cancel";
 
-  const renameBtn = document.createElement("button");
-  renameBtn.className = "image-dialog-btn confirm";
-  renameBtn.textContent = "Rename";
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "image-dialog-btn confirm";
+  saveBtn.textContent = "Save";
 
   buttons.appendChild(deleteBtn);
   buttons.appendChild(cancelBtn);
-  buttons.appendChild(renameBtn);
+  buttons.appendChild(saveBtn);
   dialog.appendChild(label);
   dialog.appendChild(input);
+  dialog.appendChild(invertLabel);
   dialog.appendChild(buttons);
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
@@ -98,15 +102,17 @@ function showImageEditDialog(
   }
   document.addEventListener("keydown", onDialogKeydown);
 
-  renameBtn.addEventListener("click", () => {
+  function save() {
     const val = input.value.trim();
-    if (val && val !== currentName) {
+    if (val && (val !== currentName || invert.checked !== image.invert)) {
       close();
-      onRename(val);
+      onSave(val, invert.checked);
     } else {
       close();
     }
-  });
+  }
+
+  saveBtn.addEventListener("click", save);
 
   cancelBtn.addEventListener("click", close);
 
@@ -122,13 +128,7 @@ function showImageEditDialog(
   input.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      const val = input.value.trim();
-      if (val && val !== currentName) {
-        close();
-        onRename(val);
-      } else {
-        close();
-      }
+      save();
     } else if (e.key === "Escape") {
       close();
     }
@@ -1323,8 +1323,29 @@ export function initMonaco(): Promise<PostDocumentController> {
         const img = parseImageLine(line);
         if (img) {
           showImageEditDialog(
-            img.path,
-            (newName) => {
+            img,
+            (newName, invert) => {
+              const updateLine = (path: string, range = new monaco.Range(ln, 1, ln, line.length + 1)) => {
+                const newLine = formatImageLine({ alt: img.alt, path, invert });
+                applyModelEdit(operationDocument?.model, "edit-image", range, newLine);
+              };
+              const currentName = img.path.split("/").pop() || "";
+              if (newName === currentName) {
+                updateLine(img.path);
+                return;
+              }
+              const operationModel = operationDocument?.model;
+              if (!operationModel || operationModel.isDisposed?.()) return;
+              const trackingIds = operationModel.deltaDecorations([], [{
+                range: new monaco.Range(ln, 1, ln, line.length + 1),
+                options: {
+                  stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+                },
+              }]);
+              const trackingId = trackingIds[0];
+              const clearTracking = () => {
+                if (!operationModel.isDisposed?.()) operationModel.deltaDecorations([trackingId], []);
+              };
               fetch("/api/rename-image", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -1336,11 +1357,15 @@ export function initMonaco(): Promise<PostDocumentController> {
                 })
                 .then((data: { path: string }) => {
                   mutationEvent({ kind: "image-rename" });
-                  const newLine = `![${img.alt}](${data.path})`;
-                  const range = new monaco.Range(ln, 1, ln, line.length + 1);
-                  applyModelEdit(operationDocument?.model, "rename-image", range, newLine);
+                  const range = operationModel.getDecorationRange(trackingId);
+                  if (!range || operationModel.getValueInRange(range) !== line) {
+                    showToast(`Image renamed to ${data.path}, but its edited reference was not replaced.`, "warning");
+                    return;
+                  }
+                  updateLine(data.path, range);
                 })
-                .catch(() => {});
+                .catch(() => showToast("Could not rename image.", "warning"))
+                .finally(clearTracking);
             },
             () => {
               fetch("/api/delete-image", {
