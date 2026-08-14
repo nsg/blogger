@@ -544,13 +544,12 @@ html, body {
   position: relative;
   z-index: 8;
   display: flex;
-  flex: 0 0 40px;
-  width: 40px;
-  min-width: 40px;
+  flex: 0 0 0px;
+  width: 0;
+  min-width: 0;
   flex-direction: column;
   overflow: hidden;
   background: var(--bg-surface);
-  border-right: 1px solid var(--border-light);
   transition: width 0.18s ease, flex-basis 0.18s ease;
 }
 
@@ -558,6 +557,7 @@ html, body {
   flex-basis: var(--archive-width);
   width: var(--archive-width);
   min-width: var(--archive-width);
+  border-right: 1px solid var(--border-light);
 }
 
 .archive-rail-header {
@@ -566,20 +566,18 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 4px;
+  padding: 0 4px 0 12px;
   background: var(--bg-main);
   border-bottom: 1px solid var(--border-light);
   flex-shrink: 0;
 }
 
 .archive-toggle {
-  flex: 0 0 32px;
   border-color: transparent;
   background: transparent;
 }
 
 .archive-title {
-  margin-left: 4px;
   font-family: var(--font-display);
   font-size: 15px;
   font-weight: 600;
@@ -1731,6 +1729,7 @@ html, body {
     gap: 4px;
   }
 
+  .brand-icon,
   .brand-name {
     display: none;
   }
