@@ -21,7 +21,7 @@ Run Blogger as a container in front of an existing Git checkout of the blog. Blo
   MCP connector.
 - Review writing with an AI assistant and insert speech-to-text dictation.
 - Preview the site through an authenticated live Zola view.
-- Commit all checkout changes and push them to GitHub manually.
+- Select checkout changes to commit and push to GitHub manually.
 - Protect the interface with a single-password login.
 
 ## Quick Start
@@ -214,7 +214,7 @@ secret requires removing and re-adding the connector in Claude.ai.
 
 ### Git publication
 
-Automatic saves only update the checkout. **Commit and push** fetches the upstream, checks for overlapping local and remote paths, shows all checkout changes, creates one commit with the confirmed subject, rebases remote-only changes when safe, and pushes the checked-out branch. If the push fails after the commit, use **Retry push**; Blogger does not create a duplicate commit.
+Automatic saves only update the checkout. **Commit and push** fetches the upstream, checks for overlapping local and remote paths, and lets you select which checkout changes belong in the next commit. Unselected changes remain in the checkout. Blogger creates one commit with the confirmed subject, rebases remote-only changes when safe, and pushes the checked-out branch. If the push fails after the commit, use **Retry push**; Blogger does not create a duplicate commit.
 
 **Sync from GitHub** fetches and fast-forwards the branch only when the working tree is clean, no local commits are unpushed, and the histories have not diverged. Blogger never syncs automatically.
 

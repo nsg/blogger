@@ -47,18 +47,27 @@ export function initGitUi(documents: PostDocumentController): GitUiController {
     }
   }
 
-  function renderFiles(container: HTMLElement, files: GitChange[]) {
+  function renderFiles(container: HTMLElement, files: GitChange[], selected: Set<string>, onChange: () => void) {
     container.replaceChildren();
     const list = document.createElement("ul");
     list.className = "git-file-list";
     for (const file of files) {
       const item = document.createElement("li");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selected.has(file.path);
+      checkbox.setAttribute("aria-label", `Include ${file.path}`);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selected.add(file.path);
+        else selected.delete(file.path);
+        onChange();
+      });
       const marker = document.createElement("span");
       marker.className = `git-kind ${file.kind}`;
       marker.textContent = kindMarker(file.kind);
       const path = document.createElement("span");
       path.textContent = file.path;
-      item.append(marker, path);
+      item.append(checkbox, marker, path);
       list.appendChild(item);
     }
     container.appendChild(list);
@@ -95,10 +104,9 @@ export function initGitUi(documents: PostDocumentController): GitUiController {
     const intro = document.createElement("p");
     intro.className = "modal-copy";
     intro.textContent = prepared.behind
-      ? "Remote-only changes will be incorporated before this commit is pushed."
-      : "The complete checkout changes below will be committed and pushed.";
+      ? "Select the changes to commit. Remote-only changes will be incorporated before it is pushed."
+      : "Select the changes to commit and push. Unselected work stays in the checkout.";
     const files = document.createElement("div");
-    renderFiles(files, prepared.files);
     const label = document.createElement("label");
     label.className = "modal-field";
     const caption = document.createElement("span");
@@ -114,6 +122,26 @@ export function initGitUi(documents: PostDocumentController): GitUiController {
     cancel.addEventListener("click", modal.close);
 
     let currentFiles = prepared.files;
+    let overallSubject = prepared.subject;
+    let lastSuggestedSubject = prepared.subject;
+    const selectedPaths = new Set(currentFiles.map((file) => file.path));
+    const updateSelection = () => {
+      const count = selectedPaths.size;
+      const selectedFiles = currentFiles.filter((file) => selectedPaths.has(file.path));
+      const nextSuggestion = count === currentFiles.length
+        ? overallSubject
+        : count === 1 ? selectedFiles[0].subject : undefined;
+      if (nextSuggestion && subject.value === lastSuggestedSubject) {
+        subject.value = nextSuggestion;
+        lastSuggestedSubject = nextSuggestion;
+      }
+      confirm.disabled = count === 0;
+      confirm.textContent = count === 0
+        ? "Select a change"
+        : `Commit and push ${count} change${count === 1 ? "" : "s"}`;
+    };
+    renderFiles(files, currentFiles, selectedPaths, updateSelection);
+    updateSelection();
     confirm.addEventListener("click", async () => {
       const commitSubject = subject.value.trim();
       if (!commitSubject) {
@@ -123,27 +151,38 @@ export function initGitUi(documents: PostDocumentController): GitUiController {
       confirm.disabled = true;
       cancel.disabled = true;
       subject.disabled = true;
+      files.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach((input) => { input.disabled = true; });
       confirm.textContent = "Publishing…";
       try {
         const result = await api<GitPublishResponse>("/api/git/commit-push", jsonRequest("POST", {
           subject: commitSubject,
-          files: currentFiles.map((file) => file.path),
+          files: [...selectedPaths],
         }));
         modal.close();
         showPushResult(result);
       } catch (error) {
         if (error instanceof ApiError && error.status === 409 && error.body.files && error.body.subject) {
+          const selectedEverything = selectedPaths.size === currentFiles.length;
           currentFiles = error.body.files;
-          renderFiles(files, currentFiles);
+          const availablePaths = new Set(currentFiles.map((file) => file.path));
+          for (const path of selectedPaths) {
+            if (!availablePaths.has(path)) selectedPaths.delete(path);
+          }
+          if (selectedEverything) {
+            for (const file of currentFiles) selectedPaths.add(file.path);
+          }
+          renderFiles(files, currentFiles, selectedPaths, updateSelection);
+          overallSubject = error.body.subject;
+          lastSuggestedSubject = error.body.subject;
           subject.value = error.body.subject;
           showModalError(modal, `${error.message}. Review the updated list and confirm again.`);
         } else {
           showModalError(modal, error instanceof Error ? error.message : "Publishing failed");
         }
-        confirm.disabled = false;
+        updateSelection();
         cancel.disabled = false;
         subject.disabled = false;
-        confirm.textContent = "Commit and push";
+        files.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach((input) => { input.disabled = false; });
       }
     });
     modal.actions.append(cancel, confirm);

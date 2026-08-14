@@ -84,7 +84,7 @@ export interface RenamePostResponse { path: string; url: string; }
 export interface RecoverPostResponse extends RenamePostResponse { revision: string; }
 
 export type GitChangeKind = "added" | "modified" | "deleted" | "renamed";
-export interface GitChange { path: string; kind: GitChangeKind; }
+export interface GitChange { path: string; kind: GitChangeKind; subject?: string; }
 
 export interface GitStatusResponse {
   changes: GitChange[];

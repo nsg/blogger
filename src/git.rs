@@ -243,9 +243,10 @@ pub async fn prepare(State(state): State<Arc<AppState>>) -> ApiResult {
         ));
     }
 
+    let files = prepared_changes_json(&state, &snapshot.changes).await;
     let subject = generated_subject(&state, &snapshot.changes).await;
     Ok(Json(json!({
-        "files": changes_json(&snapshot.changes),
+        "files": files,
         "subject": subject,
         "behind": snapshot.behind > 0,
     })))
@@ -268,35 +269,30 @@ pub async fn commit_push(
     if snapshot.ahead > 0 {
         return Err(unpushed_conflict());
     }
-    let fresh_files = public_paths(&snapshot.changes);
     let mut requested_files = requested_files;
     requested_files.sort();
-    if requested_files != fresh_files {
+    if requested_files.is_empty() {
+        return Err(bad_request("select at least one checkout change to commit"));
+    }
+    if requested_files.windows(2).any(|paths| paths[0] == paths[1]) {
+        return Err(bad_request("files must not contain duplicate paths"));
+    }
+    let selected_changes = selected_changes(&snapshot.changes, &requested_files);
+    if selected_changes.len() != requested_files.len() {
+        let files = prepared_changes_json(&state, &snapshot.changes).await;
         let subject = generated_subject(&state, &snapshot.changes).await;
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "checkout changes changed after confirmation",
-                "files": changes_json(&snapshot.changes),
+                "files": files,
                 "subject": subject,
             })),
         ));
     }
-    if snapshot.changes.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "there are no checkout changes to commit" })),
-        ));
-    }
-
-    require_command(
-        &state,
-        &["add", "-A"],
-        CommandOptions::default(),
-        "stage checkout changes",
-    )
-    .await
-    .map_err(internal_error)?;
+    stage_changes(&state, &selected_changes)
+        .await
+        .map_err(internal_error)?;
     require_command(
         &state,
         &["commit", "-m", subject],
@@ -580,7 +576,7 @@ async fn rebase(state: &AppState) -> Result<(), String> {
     let upstream = state.repository.upstream.clone();
     require_command(
         state,
-        &["rebase", &upstream],
+        &["rebase", "--autostash", &upstream],
         CommandOptions {
             identity: true,
             network: false,
@@ -905,8 +901,34 @@ fn filename_title(path: &str) -> String {
         .to_owned()
 }
 
-fn public_paths(changes: &[Change]) -> Vec<String> {
-    changes.iter().map(|change| change.path.clone()).collect()
+fn selected_changes(changes: &[Change], paths: &[String]) -> Vec<Change> {
+    changes
+        .iter()
+        .filter(|change| paths.binary_search(&change.path).is_ok())
+        .cloned()
+        .collect()
+}
+
+async fn stage_changes(state: &AppState, changes: &[Change]) -> Result<(), String> {
+    require_command(
+        state,
+        &["reset", "--mixed", "HEAD"],
+        CommandOptions::default(),
+        "clear the Git index before staging selected changes",
+    )
+    .await?;
+
+    let paths = touched_paths(changes);
+    let mut args = vec!["add", "-A", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    require_command(
+        state,
+        &args,
+        CommandOptions::default(),
+        "stage selected checkout changes",
+    )
+    .await
+    .map(|_| ())
 }
 
 fn changes_json(changes: &[Change]) -> Vec<Value> {
@@ -914,6 +936,18 @@ fn changes_json(changes: &[Change]) -> Vec<Value> {
         .iter()
         .map(|change| json!({ "path": change.path, "kind": change.kind.as_str() }))
         .collect()
+}
+
+async fn prepared_changes_json(state: &AppState, changes: &[Change]) -> Vec<Value> {
+    let mut values = Vec::with_capacity(changes.len());
+    for change in changes {
+        values.push(json!({
+            "path": change.path,
+            "kind": change.kind.as_str(),
+            "subject": generated_subject(state, std::slice::from_ref(change)).await,
+        }));
+    }
+    values
 }
 
 fn repo_blocked(repository: &Repository) -> Option<&'static str> {
@@ -1365,6 +1399,26 @@ mod tests {
             vec![
                 "content/post/old.md".to_owned(),
                 "static/images/gone.png".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_only_requested_checkout_changes() {
+        let changes = vec![
+            change("content/post/draft.md", ChangeKind::Modified),
+            renamed("content/post/old.md", "content/post/published.md"),
+            change("static/images/photo.png", ChangeKind::Added),
+        ];
+        let paths = vec![
+            "content/post/published.md".to_owned(),
+            "static/images/photo.png".to_owned(),
+        ];
+        assert_eq!(
+            selected_changes(&changes, &paths),
+            vec![
+                renamed("content/post/old.md", "content/post/published.md"),
+                change("static/images/photo.png", ChangeKind::Added),
             ]
         );
     }

@@ -846,6 +846,7 @@ html, body {
 .git-file-list { max-height: 250px; overflow: auto; list-style: none; border: 1px solid var(--border-light); border-radius: 6px; }
 .git-file-list li { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px; border-bottom: 1px solid var(--border-light); color: var(--text-secondary); font: 11px monospace; overflow-wrap: anywhere; }
 .git-file-list li:last-child { border-bottom: 0; }
+.git-file-list input { margin: 0; flex-shrink: 0; accent-color: var(--accent-indigo); }
 .git-kind { width: 14px; flex-shrink: 0; font-weight: 700; color: var(--text-tertiary); }
 .git-kind.added { color: var(--success-text); }
 .git-kind.deleted { color: var(--danger-text); }
