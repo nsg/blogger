@@ -374,6 +374,7 @@ export function initMonaco(): Promise<PostDocumentController> {
     const bannerActions = document.getElementById("editor-banner-actions")!;
     const includeContext = document.getElementById("include-context") as HTMLInputElement;
     const voiceBtn = document.getElementById("voice-record") as HTMLButtonElement | null;
+    const imageBtn = document.getElementById("add-image") as HTMLButtonElement | null;
     let voiceSupported = true;
     const voiceStatus = document.getElementById("voice-status");
     const voiceVisualizer = document.getElementById("voice-visualizer") as HTMLElement | null;
@@ -1161,6 +1162,7 @@ export function initMonaco(): Promise<PostDocumentController> {
       editorContainer.classList.remove("empty");
       includeContext.disabled = false;
       if (voiceBtn) voiceBtn.disabled = !voiceSupported;
+      if (imageBtn) imageBtn.disabled = false;
       postTitleEl.textContent = doc!.title;
       localStorage.setItem("blogger-selected-post", doc!.path);
       setSaveState(doc!.failed ? "failed" : doc!.dirty ? "unsaved" : "saved");
@@ -1193,6 +1195,7 @@ export function initMonaco(): Promise<PostDocumentController> {
       wordCountEl.textContent = "0 words";
       includeContext.disabled = true;
       if (voiceBtn) voiceBtn.disabled = true;
+      if (imageBtn) imageBtn.disabled = true;
       saveStateEl.textContent = "";
       saveRetry.hidden = true;
       clearBanner();
@@ -1457,20 +1460,23 @@ export function initMonaco(): Promise<PostDocumentController> {
       const file = imageItem.getAsFile();
       if (!file) return;
 
-      const pos = editor.getPosition();
-      if (!pos) return;
-      const uploadDocument = activeDocument;
-      const uploadModel = uploadDocument?.model;
-
       const ext = file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
       const defaultName = file.name && file.name !== "image.png" ? file.name : `paste.${ext}`;
+      uploadImageAtCursor(file, defaultName);
+    }, { capture: true });
+
+    function uploadImageAtCursor(file: File, uploadName: string) {
+      const pos = editor.getPosition();
+      const uploadDocument = activeDocument;
+      const uploadModel = uploadDocument?.model;
+      if (!pos || !uploadModel) return;
 
       const placeholder = "![uploading...]()";
       const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
-      applyModelEdit(uploadModel, "paste-image", range, placeholder);
+      applyModelEdit(uploadModel, "insert-image", range, placeholder);
 
       const form = new FormData();
-      form.append("image", file, defaultName);
+      form.append("image", file, uploadName);
 
       fetch("/api/upload-image", { method: "POST", body: form })
         .then((res) => {
@@ -1484,7 +1490,7 @@ export function initMonaco(): Promise<PostDocumentController> {
           if (!targetModel || targetModel.isDisposed?.()) return;
           const matches = targetModel.findMatches(placeholder, false, false, true, null, true);
           if (matches.length > 0) {
-            applyModelEdit(targetModel, "paste-image", matches[0].range, mdLink);
+            applyModelEdit(targetModel, "insert-image", matches[0].range, mdLink);
           }
         })
         .catch(() => {
@@ -1492,10 +1498,28 @@ export function initMonaco(): Promise<PostDocumentController> {
           if (!targetModel || targetModel.isDisposed?.()) return;
           const matches = targetModel.findMatches(placeholder, false, false, true, null, true);
           if (matches.length > 0) {
-            applyModelEdit(targetModel, "paste-image", matches[0].range, "![upload failed]()");
+            applyModelEdit(targetModel, "insert-image", matches[0].range, "![upload failed]()");
           }
         });
-    }, { capture: true });
+    }
+
+    function initImagePicker() {
+      if (!imageBtn) return;
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.hidden = true;
+      document.body.appendChild(input);
+      imageBtn.addEventListener("click", () => input.click());
+      input.addEventListener("change", () => {
+        const file = input.files?.[0];
+        input.value = "";
+        if (!file) return;
+        const ext = file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+        uploadImageAtCursor(file, file.name || `photo.${ext}`);
+      });
+    }
+    initImagePicker();
 
     S.setGetEditorValue(() => activeModel ? model.getValue() : "");
     S.setApplyEditorEdit((oldText: string, newText: string): boolean => {

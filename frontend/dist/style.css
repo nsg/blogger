@@ -343,14 +343,16 @@ html, body {
   color: var(--text-tertiary);
 }
 
-.voice-btn {
+.voice-btn,
+.image-btn {
   width: 40px;
   height: 40px;
   flex: 0 0 40px;
   margin-block: -6px;
 }
 
-.voice-btn svg {
+.voice-btn svg,
+.image-btn svg {
   width: 18px;
   height: 18px;
 }
@@ -1702,14 +1704,16 @@ html, body {
   .editor-banner { align-items: flex-start; flex-direction: column; }
   .editor-banner-actions { width: 100%; justify-content: flex-end; }
 
-  .voice-btn {
+  .voice-btn,
+  .image-btn {
     width: 44px;
     height: 44px;
     flex-basis: 44px;
     margin-block: -8px;
   }
 
-  .voice-btn svg {
+  .voice-btn svg,
+  .image-btn svg {
     width: 20px;
     height: 20px;
   }
