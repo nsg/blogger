@@ -55,6 +55,39 @@ struct OAuthClient {
     callback: &'static str,
 }
 
+impl OAuthClient {
+    fn allows_callback(&self, callback: &str) -> bool {
+        callback == self.callback
+            || (self.slug == "chatgpt" && is_chatgpt_callback_id_uri(callback))
+    }
+}
+
+fn is_chatgpt_callback_id_uri(callback: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(callback) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("chatgpt.com")
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments.collect::<Vec<_>>();
+    matches!(segments.as_slice(), ["connector", "oauth", callback_id] if
+    !callback_id.is_empty()
+        && callback_id.len() <= 128
+        && callback_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+        }))
+}
+
 #[derive(Clone)]
 pub struct OAuthState {
     inner: Arc<OAuthInner>,
@@ -149,7 +182,7 @@ impl OAuthState {
     fn client_for_callback(callback: &str) -> Option<&'static OAuthClient> {
         OAUTH_CLIENTS
             .iter()
-            .find(|client| callback == client.callback)
+            .find(|client| client.allows_callback(callback))
     }
 
     fn resource_metadata_url(&self) -> String {
@@ -292,15 +325,21 @@ async fn register(
             .all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token"));
     let responses_ok = request.response_types.is_empty()
         || request.response_types.iter().all(|kind| kind == "code");
-    let client = match request.redirect_uris.as_slice() {
-        [callback] => OAuthState::client_for_callback(callback),
-        _ => None,
-    };
+    let client = request
+        .redirect_uris
+        .first()
+        .and_then(|callback| OAuthState::client_for_callback(callback))
+        .filter(|client| {
+            request
+                .redirect_uris
+                .iter()
+                .all(|callback| client.allows_callback(callback))
+        });
     let Some(client) = client else {
         return oauth_json_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_metadata",
-            "exactly one supported public client callback is required",
+            "all redirect URIs must use one supported public client",
         );
     };
     if auth_method != "none" || !grants_ok || !responses_ok {
@@ -316,7 +355,7 @@ async fn register(
         Json(json!({
             "client_id": state.client_id(client),
             "client_id_issued_at": unix_now(),
-            "redirect_uris": [client.callback],
+            "redirect_uris": request.redirect_uris,
             "token_endpoint_auth_method": "none",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
@@ -388,7 +427,7 @@ fn validate_authorize(state: &OAuthState, request: &AuthorizeRequest) -> Result<
     if request
         .redirect_uri
         .as_deref()
-        .is_some_and(|redirect| redirect != client.callback)
+        .is_some_and(|redirect| !client.allows_callback(redirect))
     {
         return Err("invalid redirect_uri");
     }
@@ -532,12 +571,12 @@ fn authorization_error(
     if request
         .redirect_uri
         .as_deref()
-        .is_some_and(|redirect| redirect != client.callback)
+        .is_some_and(|redirect| !client.allows_callback(redirect))
     {
         return oauth_json_error(local_status, error, description);
     }
-    let mut redirect =
-        reqwest::Url::parse(client.callback).expect("the fixed callback URL is valid");
+    let callback = request.redirect_uri.as_deref().unwrap_or(client.callback);
+    let mut redirect = reqwest::Url::parse(callback).expect("the validated callback URL is valid");
     let mut parameters = redirect.query_pairs_mut();
     parameters
         .append_pair("error", error)
@@ -1182,6 +1221,61 @@ mod tests {
         let claude_client = claude["client_id"].as_str().unwrap();
         assert_ne!(chatgpt_client, claude_client);
 
+        let callback_id_uri = "https://chatgpt.com/connector/oauth/callback-id_123";
+        let callback_id_only = register_client(&client, &base, callback_id_uri).await;
+        assert_eq!(callback_id_only["client_id"], chatgpt["client_id"]);
+        let callback_id_registration = client
+            .post(format!("{base}/register"))
+            .json(&json!({
+                "redirect_uris": [CHATGPT_CALLBACK, callback_id_uri],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(callback_id_registration.status(), StatusCode::CREATED);
+        let callback_id_registration = callback_id_registration.json::<Value>().await.unwrap();
+        assert_eq!(callback_id_registration["client_id"], chatgpt["client_id"]);
+        assert_eq!(
+            callback_id_registration["redirect_uris"],
+            json!([CHATGPT_CALLBACK, callback_id_uri])
+        );
+
+        let mut callback_id_error_url = Url::parse(&format!("{base}/authorize")).unwrap();
+        callback_id_error_url
+            .query_pairs_mut()
+            .append_pair("client_id", chatgpt_client)
+            .append_pair("redirect_uri", callback_id_uri)
+            .append_pair("state", "callback-id-state");
+        let callback_id_error = client.get(callback_id_error_url).send().await.unwrap();
+        assert_eq!(callback_id_error.status(), StatusCode::SEE_OTHER);
+        let callback_id_error = Url::parse(
+            callback_id_error
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            callback_id_error.as_str().split('?').next(),
+            Some(callback_id_uri)
+        );
+        let callback_id_error_parameters = callback_id_error
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            callback_id_error_parameters.get("state").unwrap(),
+            "callback-id-state"
+        );
+        assert_eq!(
+            callback_id_error_parameters.get("iss").unwrap(),
+            "https://mcp.example.com"
+        );
+
         let mut incomplete_url = Url::parse(&format!("{base}/authorize")).unwrap();
         incomplete_url
             .query_pairs_mut()
@@ -1221,8 +1315,14 @@ mod tests {
         );
 
         for redirect_uris in [
-            json!(["https://chatgpt.com/connector/oauth/callback-id"]),
+            json!([]),
             json!([CHATGPT_CALLBACK, CLAUDE_CALLBACK]),
+            json!(["http://chatgpt.com/connector/oauth/callback-id"]),
+            json!(["https://chatgpt.com:444/connector/oauth/callback-id"]),
+            json!(["https://chatgpt.com/connector/oauth/"]),
+            json!(["https://chatgpt.com/connector/oauth/callback-id/extra"]),
+            json!(["https://chatgpt.com/connector/oauth/callback-id?next=evil"]),
+            json!(["https://chatgpt.com/connector/oauth/callback%2Fid"]),
         ] {
             let rejected = client
                 .post(format!("{base}/register"))
@@ -1291,17 +1391,17 @@ mod tests {
             &challenge,
             "chatgpt-state-2",
             "password",
-            CHATGPT_CALLBACK,
+            callback_id_uri,
         )
         .await;
-        let code = redirect_code(&authorized, "chatgpt-state-2", CHATGPT_CALLBACK);
+        let code = redirect_code(&authorized, "chatgpt-state-2", callback_id_uri);
         let tokens = client
             .post(format!("{base}/token"))
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("client_id", chatgpt_client),
                 ("code", code.as_str()),
-                ("redirect_uri", CHATGPT_CALLBACK),
+                ("redirect_uri", callback_id_uri),
                 ("code_verifier", verifier),
                 ("resource", "https://mcp.example.com/mcp"),
             ])

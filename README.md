@@ -174,6 +174,8 @@ Add the value of `BLOGGER_MCP_PUBLIC_URL` as an OAuth-authenticated custom plugi
 in ChatGPT or a custom connector in Claude.ai. The client discovers Blogger's
 OAuth endpoints automatically. The authorization page is served by Blogger and
 accepts `BLOGGER_PASSWORD`; the password is never sent to the MCP client.
+Both ChatGPT's stable redirect URI and its callback-ID-specific redirect URI
+are supported.
 Authorization grants `posts:read` and `posts:write`. Write access is limited to
 drafts and the fixed writing-style guide; it cannot access the private web
 interface or REST API.
