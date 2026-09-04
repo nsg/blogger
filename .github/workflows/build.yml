@@ -60,3 +60,26 @@ jobs:
           tags: |
             ghcr.io/nsg/blogger:latest
             ghcr.io/nsg/blogger:sha-${{ github.sha }}
+
+  reconcile:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+      id-token: write
+    steps:
+      - name: Request Kubernetes reconciliation
+        env:
+          AUDIENCE: https://reconcile.k8s.junkpile.se
+          ENDPOINT: https://reconcile.k8s.junkpile.se/v1/reconcile/blogger
+        run: |
+          encoded_audience="$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["AUDIENCE"], safe=""))')"
+          token="$(curl --fail --silent --show-error \
+            --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encoded_audience}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${token}" \
+            --data '' \
+            "${ENDPOINT}"
