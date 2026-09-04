@@ -17,8 +17,8 @@ Run Blogger as a container in front of an existing Git checkout of the blog. Blo
 - Edit multiple posts with automatic saves and external-change conflict detection.
 - Create and preview draft posts.
 - Share a versioned writing-style profile and search, create, or revise drafts
-  from Claude.ai chat or Claude Mobile voice mode through the protected remote
-  MCP connector.
+  from ChatGPT, Claude.ai chat, or Claude Mobile voice mode through the
+  protected remote MCP connector.
 - Review writing with an AI assistant and insert speech-to-text dictation.
 - Preview the site through an authenticated live Zola view.
 - Select checkout changes to commit and push to GitHub manually.
@@ -139,12 +139,12 @@ blogger [SEARCH_ROOT]
 
 Use `GET /api/health` as the liveness probe. It reports that the Blogger process is serving requests. Use `GET /api/ready` as the readiness probe; it succeeds after the private Zola preview responds. Both endpoints are unauthenticated.
 
-## Claude remote connector
+## Remote MCP connector
 
-Blogger provides a remote MCP connector for Claude.ai and Claude Mobile. It
-exposes `list_archive`, `list_tags`, `search_posts`, and `get_post` for reading
-published posts and drafts. `list_archive` returns only post titles and
-`list_tags` returns unique tags as compact overviews; `search_posts` matches
+Blogger provides a remote MCP connector for ChatGPT, Claude.ai, and Claude
+Mobile. It exposes `list_archive`, `list_tags`, `search_posts`, and `get_post`
+for reading published posts and drafts. `list_archive` returns only post titles
+and `list_tags` returns unique tags as compact overviews; `search_posts` matches
 titles as well as the complete Markdown content.
 `get_writing_style` reads the complete `WRITING_STYLE.md` file at the Zola site
 root, and `replace_writing_style` creates or replaces that file as a single
@@ -170,16 +170,17 @@ tool returns a null revision. These checks prevent silent overwrites. The
 connector cannot modify published posts, publish, delete, rename, manage images,
 commit, push, or access arbitrary files other than the fixed writing-style file.
 
-Add the value of `BLOGGER_MCP_PUBLIC_URL` as a custom connector in Claude.ai.
-Claude discovers Blogger's OAuth endpoints automatically. The authorization page
-is served by Blogger and accepts `BLOGGER_PASSWORD`; the password is never sent
-to Claude. Authorization grants `posts:read` and `posts:write`. Write access is
-limited to drafts and the fixed writing-style guide; it cannot access the
-private web interface or REST API.
+Add the value of `BLOGGER_MCP_PUBLIC_URL` as an OAuth-authenticated custom plugin
+in ChatGPT or a custom connector in Claude.ai. The client discovers Blogger's
+OAuth endpoints automatically. The authorization page is served by Blogger and
+accepts `BLOGGER_PASSWORD`; the password is never sent to the MCP client.
+Authorization grants `posts:read` and `posts:write`. Write access is limited to
+drafts and the fixed writing-style guide; it cannot access the private web
+interface or REST API.
 
 After upgrading an existing read-only deployment, reauthorize the connector so
-Claude receives `posts:write`. Existing read-only tokens never acquire write
-access automatically.
+the client receives `posts:write`. Existing read-only tokens never acquire
+write access automatically.
 
 ### Deployment contract
 
@@ -208,9 +209,9 @@ arrive as `/mcp`.
 Blogger uses in-memory MCP sessions and OAuth grants, consistent with its
 single-replica deployment requirement. A pod restart disconnects active MCP
 sessions and invalidates access and refresh tokens; reconnect and authorize the
-connector again. The dynamically registered Claude client ID is stable across
-restarts as long as `BLOGGER_SESSION_SECRET` remains unchanged. Rotating that
-secret requires removing and re-adding the connector in Claude.ai.
+connector again. Dynamically registered ChatGPT and Claude client IDs are stable
+across restarts as long as `BLOGGER_SESSION_SECRET` remains unchanged. Rotating
+that secret requires removing and re-adding the plugin or connector.
 
 ### Git publication
 

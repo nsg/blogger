@@ -28,6 +28,19 @@ use crate::{
 };
 
 const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+static OAUTH_CLIENTS: &[OAuthClient] = &[
+    OAuthClient {
+        slug: "claude",
+        name: "Claude",
+        callback: CLAUDE_CALLBACK,
+    },
+    OAuthClient {
+        slug: "chatgpt",
+        name: "ChatGPT",
+        callback: CHATGPT_CALLBACK,
+    },
+];
 const READ_SCOPE: &str = "posts:read";
 const WRITE_SCOPE: &str = "posts:write";
 const FULL_SCOPE: &str = "posts:read posts:write";
@@ -35,6 +48,12 @@ const CODE_LIFETIME_SECS: u64 = 5 * 60;
 const ACCESS_LIFETIME_SECS: u64 = 60 * 60;
 const REFRESH_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_ACTIVE_GRANTS: usize = 256;
+
+struct OAuthClient {
+    slug: &'static str,
+    name: &'static str,
+    callback: &'static str,
+}
 
 #[derive(Clone)]
 pub struct OAuthState {
@@ -105,19 +124,32 @@ impl OAuthState {
         }
     }
 
-    fn client_id(&self) -> String {
+    fn client_id(&self, client: &OAuthClient) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.inner.session_secret)
             .expect("HMAC accepts a 32-byte key");
         mac.update(b"blogger-mcp-oauth-client-v1\0");
-        mac.update(CLAUDE_CALLBACK.as_bytes());
+        mac.update(client.callback.as_bytes());
         format!(
-            "blogger-claude-{}",
+            "blogger-{}-{}",
+            client.slug,
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         )
     }
 
     fn valid_client(&self, client_id: &str) -> bool {
-        token_eq(client_id, &self.client_id())
+        self.client_for_id(client_id).is_some()
+    }
+
+    fn client_for_id(&self, client_id: &str) -> Option<&'static OAuthClient> {
+        OAUTH_CLIENTS
+            .iter()
+            .find(|client| token_eq(client_id, &self.client_id(client)))
+    }
+
+    fn client_for_callback(callback: &str) -> Option<&'static OAuthClient> {
+        OAUTH_CLIENTS
+            .iter()
+            .find(|client| callback == client.callback)
     }
 
     fn resource_metadata_url(&self) -> String {
@@ -220,6 +252,7 @@ async fn protected_resource_metadata(State(state): State<OAuthState>) -> Respons
 async fn authorization_server_metadata(State(state): State<OAuthState>) -> Response {
     no_store(Json(json!({
         "issuer": state.inner.issuer,
+        "authorization_response_iss_parameter_supported": true,
         "authorization_endpoint": format!("{}/authorize", state.inner.issuer),
         "token_endpoint": format!("{}/token", state.inner.issuer),
         "registration_endpoint": format!("{}/register", state.inner.issuer),
@@ -259,24 +292,31 @@ async fn register(
             .all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token"));
     let responses_ok = request.response_types.is_empty()
         || request.response_types.iter().all(|kind| kind == "code");
-    if request.redirect_uris.as_slice() != [CLAUDE_CALLBACK]
-        || auth_method != "none"
-        || !grants_ok
-        || !responses_ok
-    {
+    let client = match request.redirect_uris.as_slice() {
+        [callback] => OAuthState::client_for_callback(callback),
+        _ => None,
+    };
+    let Some(client) = client else {
         return oauth_json_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_metadata",
-            "only the Claude.ai public client callback is supported",
+            "exactly one supported public client callback is required",
+        );
+    };
+    if auth_method != "none" || !grants_ok || !responses_ok {
+        return oauth_json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "only public clients using authorization code with PKCE are supported",
         );
     }
 
     no_store((
         StatusCode::CREATED,
         Json(json!({
-            "client_id": state.client_id(),
+            "client_id": state.client_id(client),
             "client_id_issued_at": unix_now(),
-            "redirect_uris": [CLAUDE_CALLBACK],
+            "redirect_uris": [client.callback],
             "token_endpoint_auth_method": "none",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
@@ -286,27 +326,43 @@ async fn register(
 
 #[derive(Clone, Deserialize)]
 struct AuthorizeRequest {
+    #[serde(default)]
     client_id: String,
     #[serde(default)]
     redirect_uri: Option<String>,
+    #[serde(default)]
     response_type: String,
+    #[serde(default)]
     scope: String,
+    #[serde(default)]
     state: String,
+    #[serde(default)]
     code_challenge: String,
+    #[serde(default)]
     code_challenge_method: String,
+    #[serde(default)]
     resource: String,
 }
 
 #[derive(Deserialize)]
 struct AuthorizeSubmission {
+    #[serde(default)]
     client_id: String,
-    redirect_uri: String,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
     response_type: String,
+    #[serde(default)]
     scope: String,
+    #[serde(default)]
     state: String,
+    #[serde(default)]
     code_challenge: String,
+    #[serde(default)]
     code_challenge_method: String,
+    #[serde(default)]
     resource: String,
+    #[serde(default)]
     password: String,
 }
 
@@ -314,7 +370,7 @@ impl AuthorizeSubmission {
     fn request(&self) -> AuthorizeRequest {
         AuthorizeRequest {
             client_id: self.client_id.clone(),
-            redirect_uri: Some(self.redirect_uri.clone()),
+            redirect_uri: self.redirect_uri.clone(),
             response_type: self.response_type.clone(),
             scope: self.scope.clone(),
             state: self.state.clone(),
@@ -326,13 +382,13 @@ impl AuthorizeSubmission {
 }
 
 fn validate_authorize(state: &OAuthState, request: &AuthorizeRequest) -> Result<(), &'static str> {
-    if !state.valid_client(&request.client_id) {
+    let Some(client) = state.client_for_id(&request.client_id) else {
         return Err("unknown client_id");
-    }
+    };
     if request
         .redirect_uri
         .as_deref()
-        .is_some_and(|redirect| redirect != CLAUDE_CALLBACK)
+        .is_some_and(|redirect| redirect != client.callback)
     {
         return Err("invalid redirect_uri");
     }
@@ -359,15 +415,24 @@ async fn authorize_page(
     Query(request): Query<AuthorizeRequest>,
 ) -> Response {
     if let Err(message) = validate_authorize(&state, &request) {
-        return oauth_json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+        return authorization_error(
+            &state,
+            &request,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            message,
+        );
     }
+    let client = state
+        .client_for_id(&request.client_id)
+        .expect("validated client ID has a callback");
     let fields = [
         ("client_id", request.client_id),
         (
             "redirect_uri",
             request
                 .redirect_uri
-                .unwrap_or_else(|| CLAUDE_CALLBACK.to_owned()),
+                .unwrap_or_else(|| client.callback.to_owned()),
         ),
         ("response_type", request.response_type),
         ("scope", request.scope),
@@ -386,7 +451,8 @@ async fn authorize_page(
     })
     .collect::<String>();
     let page = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize Claude</h1><p>Allow access to read blog posts and the writing-style guide, and to create or edit drafts or replace that guide. Claude cannot publish, delete, commit, or push.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Blogger</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#f9fafb}}main{{width:min(24rem,calc(100vw - 2rem))}}label{{display:block;margin-bottom:.5rem;font-weight:650}}input[type=password]{{box-sizing:border-box;width:100%;padding:.75rem;font:inherit;background:#1f2937;color:inherit;border:1px solid #4b5563;border-radius:.35rem}}button{{margin-top:.75rem;width:100%;padding:.75rem;font:inherit;font-weight:650;cursor:pointer}}</style></head><body><main><h1>Authorize {client_name}</h1><p>Allow {client_name} to read blog posts and the writing-style guide, and to create or edit drafts or replace that guide. {client_name} cannot publish, delete, commit, or push.</p><form method="post" action="/authorize">{fields}<label for="password">Blogger password</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Authorize</button></form></main></body></html>"#,
+        client_name = client.name,
     );
     secure_html(Html(page))
 }
@@ -397,14 +463,22 @@ async fn authorize(
 ) -> Response {
     let request = submission.request();
     if let Err(message) = validate_authorize(&state, &request) {
-        return oauth_json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+        return authorization_error(
+            &state,
+            &request,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            message,
+        );
     }
     if !state
         .inner
         .password_gate
         .verify(Some(&submission.password), &state.inner.password)
     {
-        return oauth_json_error(
+        return authorization_error(
+            &state,
+            &request,
             StatusCode::UNAUTHORIZED,
             "access_denied",
             "incorrect password",
@@ -412,6 +486,9 @@ async fn authorize(
     }
 
     let now = unix_now();
+    let client = state
+        .client_for_id(&request.client_id)
+        .expect("validated client ID has a callback");
     let code = random_token();
     let grant = AuthorizationCode {
         grant_id: random_token(),
@@ -419,7 +496,7 @@ async fn authorize(
         redirect_uri: request
             .redirect_uri
             .clone()
-            .unwrap_or_else(|| CLAUDE_CALLBACK.to_owned()),
+            .unwrap_or_else(|| client.callback.to_owned()),
         code_challenge: request.code_challenge,
         resource: request.resource,
         scope: FULL_SCOPE.to_owned(),
@@ -432,12 +509,44 @@ async fn authorize(
     drop(grants);
 
     let mut redirect =
-        reqwest::Url::parse(request.redirect_uri.as_deref().unwrap_or(CLAUDE_CALLBACK))
-            .expect("the fixed Claude callback URL is valid");
+        reqwest::Url::parse(request.redirect_uri.as_deref().unwrap_or(client.callback))
+            .expect("the fixed client callback URL is valid");
     redirect
         .query_pairs_mut()
         .append_pair("code", &code)
-        .append_pair("state", &request.state);
+        .append_pair("state", &request.state)
+        .append_pair("iss", &state.inner.issuer);
+    no_store(Redirect::to(redirect.as_str()))
+}
+
+fn authorization_error(
+    state: &OAuthState,
+    request: &AuthorizeRequest,
+    local_status: StatusCode,
+    error: &str,
+    description: &str,
+) -> Response {
+    let Some(client) = state.client_for_id(&request.client_id) else {
+        return oauth_json_error(local_status, error, description);
+    };
+    if request
+        .redirect_uri
+        .as_deref()
+        .is_some_and(|redirect| redirect != client.callback)
+    {
+        return oauth_json_error(local_status, error, description);
+    }
+    let mut redirect =
+        reqwest::Url::parse(client.callback).expect("the fixed callback URL is valid");
+    let mut parameters = redirect.query_pairs_mut();
+    parameters
+        .append_pair("error", error)
+        .append_pair("error_description", description);
+    if !request.state.is_empty() {
+        parameters.append_pair("state", &request.state);
+    }
+    parameters.append_pair("iss", &state.inner.issuer);
+    drop(parameters);
     no_store(Redirect::to(redirect.as_str()))
 }
 
@@ -622,6 +731,7 @@ async fn revoke(State(state): State<OAuthState>, Form(request): Form<RevokeReque
         .access_tokens
         .get(&request.token)
         .or_else(|| grants.refresh_tokens.get(&request.token))
+        .filter(|grant| token_eq(&grant.client_id, &request.client_id))
         .map(|grant| (grant.grant_id.clone(), grant.expires_at))
         .or_else(|| {
             grants
@@ -817,8 +927,8 @@ fn valid_pkce_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_LIFETIME_SECS, AsyncMutex, CLAUDE_CALLBACK, FULL_SCOPE, OAuthState, PasswordGate,
-        READ_SCOPE, TokenGrant, html_escape, public_router, unix_now,
+        ACCESS_LIFETIME_SECS, AsyncMutex, CHATGPT_CALLBACK, CLAUDE_CALLBACK, FULL_SCOPE,
+        OAuthState, PasswordGate, READ_SCOPE, TokenGrant, html_escape, public_router, unix_now,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use reqwest::{Client, StatusCode, Url, header};
@@ -844,8 +954,27 @@ mod tests {
     #[test]
     fn client_id_is_stable_and_secret_bound() {
         let state = state();
-        assert_eq!(state.client_id(), state.client_id());
-        assert!(state.valid_client(&state.client_id()));
+        let claude_client = OAuthState::client_for_callback(CLAUDE_CALLBACK).unwrap();
+        let chatgpt_client = OAuthState::client_for_callback(CHATGPT_CALLBACK).unwrap();
+        let claude = state.client_id(claude_client);
+        let chatgpt = state.client_id(chatgpt_client);
+        assert_eq!(
+            claude,
+            "blogger-claude-XtB_aCZn2ESDl7slCtE-MeYETCjT870qug0eqRmcVks"
+        );
+        assert_eq!(claude, state.client_id(claude_client));
+        assert_eq!(chatgpt, state.client_id(chatgpt_client));
+        assert_ne!(claude, chatgpt);
+        assert!(state.valid_client(&claude));
+        assert!(state.valid_client(&chatgpt));
+        assert_eq!(
+            state.client_for_id(&claude).map(|client| client.callback),
+            Some(CLAUDE_CALLBACK)
+        );
+        assert_eq!(
+            state.client_for_id(&chatgpt).map(|client| client.callback),
+            Some(CHATGPT_CALLBACK)
+        );
         assert!(!state.valid_client("blogger-claude-wrong"));
     }
 
@@ -946,12 +1075,13 @@ mod tests {
         challenge: &str,
         state_value: &str,
         password: &str,
+        callback: &str,
     ) -> reqwest::Response {
         client
             .post(format!("{base}/authorize"))
             .form(&[
                 ("client_id", client_id),
-                ("redirect_uri", CLAUDE_CALLBACK),
+                ("redirect_uri", callback),
                 ("response_type", "code"),
                 ("scope", FULL_SCOPE),
                 ("state", state_value),
@@ -965,16 +1095,22 @@ mod tests {
             .unwrap()
     }
 
-    fn redirect_code(response: &reqwest::Response, expected_state: &str) -> String {
+    fn redirect_code(
+        response: &reqwest::Response,
+        expected_state: &str,
+        expected_callback: &str,
+    ) -> String {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get(header::LOCATION).unwrap();
         let url = Url::parse(location.to_str().unwrap()).unwrap();
-        assert_eq!(url.origin().ascii_serialization(), "https://claude.ai");
-        assert_eq!(url.path(), "/api/mcp/auth_callback");
+        let callback = Url::parse(expected_callback).unwrap();
+        assert_eq!(url.origin(), callback.origin());
+        assert_eq!(url.path(), callback.path());
         let parameters = url
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(parameters.get("state").unwrap(), expected_state);
+        assert_eq!(parameters.get("iss").unwrap(), "https://mcp.example.com");
         parameters.get("code").unwrap().to_string()
     }
 
@@ -993,13 +1129,257 @@ mod tests {
             token.clone(),
             TokenGrant {
                 grant_id: "old-read-only-grant".to_owned(),
-                client_id: state.client_id(),
+                client_id: state
+                    .client_id(OAuthState::client_for_callback(CLAUDE_CALLBACK).unwrap()),
                 resource: state.inner.public_url.clone(),
                 scope: READ_SCOPE.to_owned(),
                 expires_at: unix_now() + ACCESS_LIFETIME_SECS,
             },
         );
         token
+    }
+
+    async fn register_client(client: &Client, base: &str, callback: &str) -> Value {
+        let response = client
+            .post(format!("{base}/register"))
+            .json(&json!({
+                "client_name": "Blogger OAuth test",
+                "redirect_uris": [callback],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let registration = response.json::<Value>().await.unwrap();
+        assert_eq!(registration["redirect_uris"], json!([callback]));
+        registration
+    }
+
+    #[tokio::test]
+    async fn supports_chatgpt_oauth_and_keeps_clients_bound() {
+        let (_site, base, state, server) = start_test_server().await;
+        let client = test_client();
+
+        let metadata = client
+            .get(format!("{base}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata["authorization_response_iss_parameter_supported"],
+            true
+        );
+
+        let chatgpt = register_client(&client, &base, CHATGPT_CALLBACK).await;
+        let chatgpt_client = chatgpt["client_id"].as_str().unwrap();
+        let claude = register_client(&client, &base, CLAUDE_CALLBACK).await;
+        let claude_client = claude["client_id"].as_str().unwrap();
+        assert_ne!(chatgpt_client, claude_client);
+
+        let mut incomplete_url = Url::parse(&format!("{base}/authorize")).unwrap();
+        incomplete_url
+            .query_pairs_mut()
+            .append_pair("client_id", chatgpt_client)
+            .append_pair("redirect_uri", CHATGPT_CALLBACK)
+            .append_pair("state", "incomplete-state");
+        let incomplete = client.get(incomplete_url).send().await.unwrap();
+        assert_eq!(incomplete.status(), StatusCode::SEE_OTHER);
+        let incomplete_url = Url::parse(
+            incomplete
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            incomplete_url.origin().ascii_serialization(),
+            "https://chatgpt.com"
+        );
+        assert_eq!(incomplete_url.path(), "/connector_platform_oauth_redirect");
+        let incomplete_parameters = incomplete_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            incomplete_parameters.get("error").unwrap(),
+            "invalid_request"
+        );
+        assert_eq!(
+            incomplete_parameters.get("state").unwrap(),
+            "incomplete-state"
+        );
+        assert_eq!(
+            incomplete_parameters.get("iss").unwrap(),
+            "https://mcp.example.com"
+        );
+
+        for redirect_uris in [
+            json!(["https://chatgpt.com/connector/oauth/callback-id"]),
+            json!([CHATGPT_CALLBACK, CLAUDE_CALLBACK]),
+        ] {
+            let rejected = client
+                .post(format!("{base}/register"))
+                .json(&json!({"redirect_uris": redirect_uris}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let verifier = "chatgpt-pkce-verifier-that-is-long-enough-for-oauth-123456789";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let mut authorize_url = Url::parse(&format!("{base}/authorize")).unwrap();
+        authorize_url
+            .query_pairs_mut()
+            .append_pair("client_id", chatgpt_client)
+            .append_pair("response_type", "code")
+            .append_pair("scope", FULL_SCOPE)
+            .append_pair("state", "chatgpt-state")
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("resource", "https://mcp.example.com/mcp");
+        let page = client.get(authorize_url.clone()).send().await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let page = page.text().await.unwrap();
+        assert!(page.contains("Authorize ChatGPT"));
+        assert!(page.contains(CHATGPT_CALLBACK));
+
+        authorize_url
+            .query_pairs_mut()
+            .append_pair("redirect_uri", CLAUDE_CALLBACK);
+        let mismatched = client.get(authorize_url).send().await.unwrap();
+        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+
+        let authorized = authorize_code(
+            &client,
+            &base,
+            chatgpt_client,
+            &challenge,
+            "chatgpt-state",
+            "password",
+            CHATGPT_CALLBACK,
+        )
+        .await;
+        let code = redirect_code(&authorized, "chatgpt-state", CHATGPT_CALLBACK);
+
+        let wrong_client = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", claude_client),
+                ("code", code.as_str()),
+                ("redirect_uri", CHATGPT_CALLBACK),
+                ("code_verifier", verifier),
+                ("resource", "https://mcp.example.com/mcp"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_client.status(), StatusCode::BAD_REQUEST);
+
+        let authorized = authorize_code(
+            &client,
+            &base,
+            chatgpt_client,
+            &challenge,
+            "chatgpt-state-2",
+            "password",
+            CHATGPT_CALLBACK,
+        )
+        .await;
+        let code = redirect_code(&authorized, "chatgpt-state-2", CHATGPT_CALLBACK);
+        let tokens = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", chatgpt_client),
+                ("code", code.as_str()),
+                ("redirect_uri", CHATGPT_CALLBACK),
+                ("code_verifier", verifier),
+                ("resource", "https://mcp.example.com/mcp"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tokens.status(), StatusCode::OK);
+        let tokens = tokens.json::<Value>().await.unwrap();
+        let access_token = tokens["access_token"].as_str().unwrap();
+        let refresh_token = tokens["refresh_token"].as_str().unwrap();
+
+        let wrong_revoke = client
+            .post(format!("{base}/revoke"))
+            .form(&[("token", access_token), ("client_id", claude_client)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_revoke.status(), StatusCode::OK);
+        assert!(
+            state
+                .validate_access_token(access_token, unix_now())
+                .is_some()
+        );
+
+        let wrong_refresh = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", claude_client),
+                ("refresh_token", refresh_token),
+                ("resource", "https://mcp.example.com/mcp"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_refresh.status(), StatusCode::BAD_REQUEST);
+
+        let refreshed = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", chatgpt_client),
+                ("refresh_token", refresh_token),
+                ("resource", "https://mcp.example.com/mcp"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let refreshed = refreshed.json::<Value>().await.unwrap();
+        let next_refresh = refreshed["refresh_token"].as_str().unwrap();
+
+        let wrong_replay = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", claude_client),
+                ("refresh_token", refresh_token),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_replay.status(), StatusCode::BAD_REQUEST);
+
+        let still_refreshable = client
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", chatgpt_client),
+                ("refresh_token", next_refresh),
+                ("resource", "https://mcp.example.com/mcp"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(still_refreshable.status(), StatusCode::BAD_REQUEST);
+
+        server.abort();
     }
 
     async fn mcp_post(
@@ -1057,6 +1437,10 @@ mod tests {
             .unwrap();
         assert_eq!(metadata["code_challenge_methods_supported"][0], "S256");
         assert_eq!(
+            metadata["authorization_response_iss_parameter_supported"],
+            true
+        );
+        assert_eq!(
             metadata["scopes_supported"],
             json!(["posts:read", "posts:write"])
         );
@@ -1104,10 +1488,29 @@ mod tests {
             &challenge,
             "claude-state",
             "wrong",
+            CLAUDE_CALLBACK,
         )
         .await;
-        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-        assert!(!wrong.text().await.unwrap().contains("wrong"));
+        assert_eq!(wrong.status(), StatusCode::SEE_OTHER);
+        let wrong_url = Url::parse(
+            wrong
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let wrong_parameters = wrong_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(wrong_parameters.get("error").unwrap(), "access_denied");
+        assert_eq!(wrong_parameters.get("state").unwrap(), "claude-state");
+        assert_eq!(
+            wrong_parameters.get("iss").unwrap(),
+            "https://mcp.example.com"
+        );
+        assert!(!wrong_url.as_str().contains("wrong"));
 
         let authorized = authorize_code(
             &client,
@@ -1116,9 +1519,10 @@ mod tests {
             &challenge,
             "claude-state",
             "password",
+            CLAUDE_CALLBACK,
         )
         .await;
-        let code = redirect_code(&authorized, "claude-state");
+        let code = redirect_code(&authorized, "claude-state", CLAUDE_CALLBACK);
         let token_response = client
             .post(format!("{base}/token"))
             .form(&[
@@ -1657,9 +2061,10 @@ mod tests {
             &challenge,
             "second-state",
             "password",
+            CLAUDE_CALLBACK,
         )
         .await;
-        let second_code = redirect_code(&second_authorized, "second-state");
+        let second_code = redirect_code(&second_authorized, "second-state", CLAUDE_CALLBACK);
         let second_tokens: Value = client
             .post(format!("{base}/token"))
             .form(&[
