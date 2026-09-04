@@ -100,7 +100,7 @@ fn decode_session_secret(secret: &str) -> Result<[u8; 32], String> {
     }
 
     let mut decoded = [0; 32];
-    for (index, pair) in secret.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in secret.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_value(pair[0]).ok_or_else(|| ERROR.to_string())?;
         let low = hex_value(pair[1]).ok_or_else(|| ERROR.to_string())?;
         decoded[index] = high << 4 | low;
